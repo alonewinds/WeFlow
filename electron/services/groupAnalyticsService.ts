@@ -468,10 +468,11 @@ class GroupAnalyticsService {
     return fallback
   }
 
-  private buildGroupMembersPanelCacheKey(chatroomId: string): string {
+  private buildGroupMembersPanelCacheKey(chatroomId: string, includeMessageCounts: boolean): string {
     const dbPath = String(this.configService.get('dbPath') || '').trim()
     const wxid = this.cleanAccountDirName(String(this.configService.get('myWxid') || '').trim())
-    return `${dbPath}::${wxid}::${chatroomId}`
+    const mode = includeMessageCounts ? 'full' : 'members'
+    return `${dbPath}::${wxid}::${chatroomId}::${mode}`
   }
 
   private pruneGroupMembersPanelCache(maxEntries: number = 80): void {
@@ -495,7 +496,11 @@ class GroupAnalyticsService {
       if (batch.length === 0) continue
 
       const inList = batch.map((username) => `'${username.replace(/'/g, "''")}'`).join(',')
-      const sql = `SELECT * FROM contact WHERE username IN (${inList})`
+      const sql = `
+        SELECT username, user_name, encrypt_username, encrypt_user_name, remark, nick_name, alias, local_type
+        FROM contact
+        WHERE username IN (${inList})
+      `
       const result = await wcdbService.execQuery('contact', null, sql)
       if (!result.success || !result.rows) continue
 
@@ -790,7 +795,8 @@ class GroupAnalyticsService {
   }
 
   private async loadGroupMembersPanelDataFresh(
-    chatroomId: string
+    chatroomId: string,
+    includeMessageCounts: boolean
   ): Promise<{ success: boolean; data?: GroupMembersPanelEntry[]; error?: string }> {
     const membersResult = await wcdbService.getGroupMembers(chatroomId)
     if (!membersResult.success || !membersResult.members) {
@@ -813,7 +819,9 @@ class GroupAnalyticsService {
     const displayNamesPromise = wcdbService.getDisplayNames(usernames)
     const contactLookupPromise = this.buildGroupMemberContactLookup(usernames)
     const ownerPromise = this.detectGroupOwnerUsername(chatroomId, members)
-    const messageCountLookupPromise = this.buildGroupMessageCountLookup(chatroomId)
+    const messageCountLookupPromise = includeMessageCounts
+      ? this.buildGroupMessageCountLookup(chatroomId)
+      : Promise.resolve(new Map<string, number>())
 
     const [displayNames, contactLookup, ownerUsername, messageCountLookup] = await Promise.all([
       displayNamesPromise,
@@ -879,13 +887,15 @@ class GroupAnalyticsService {
 
   async getGroupMembersPanelData(
     chatroomId: string,
-    forceRefresh: boolean = false
+    options?: { forceRefresh?: boolean; includeMessageCounts?: boolean }
   ): Promise<{ success: boolean; data?: GroupMembersPanelEntry[]; error?: string; fromCache?: boolean; updatedAt?: number }> {
     try {
       const normalizedChatroomId = String(chatroomId || '').trim()
       if (!normalizedChatroomId) return { success: false, error: '群聊ID不能为空' }
 
-      const cacheKey = this.buildGroupMembersPanelCacheKey(normalizedChatroomId)
+      const forceRefresh = Boolean(options?.forceRefresh)
+      const includeMessageCounts = options?.includeMessageCounts !== false
+      const cacheKey = this.buildGroupMembersPanelCacheKey(normalizedChatroomId, includeMessageCounts)
       const now = Date.now()
       const cached = this.groupMembersPanelCache.get(cacheKey)
       if (!forceRefresh && cached && now - cached.updatedAt < this.groupMembersPanelCacheTtlMs) {
@@ -901,7 +911,7 @@ class GroupAnalyticsService {
         const conn = await this.ensureConnected()
         if (!conn.success) return { success: false, error: conn.error }
 
-        const fresh = await this.loadGroupMembersPanelDataFresh(normalizedChatroomId)
+        const fresh = await this.loadGroupMembersPanelDataFresh(normalizedChatroomId, includeMessageCounts)
         if (!fresh.success || !fresh.data) {
           return { success: false, error: fresh.error || '获取群成员面板数据失败' }
         }

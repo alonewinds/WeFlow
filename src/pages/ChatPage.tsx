@@ -281,6 +281,7 @@ interface SessionPreviewCachePayload {
 interface GroupMembersPanelCacheEntry {
   updatedAt: number
   members: GroupPanelMember[]
+  includeMessageCounts: boolean
 }
 
 // 全局头像加载队列管理器已移至 src/utils/AvatarLoadQueue.ts
@@ -1033,6 +1034,88 @@ function ChatPage(_props: ChatPageProps) {
     }
   }, [applySessionDetailStats, currentSessionId, isLoadingRelationStats])
 
+  const normalizeGroupPanelMembers = useCallback((payload: GroupPanelMember[]): GroupPanelMember[] => {
+    const membersPayload = Array.isArray(payload) ? payload : []
+    return membersPayload
+      .map((member: GroupPanelMember): GroupPanelMember | null => {
+        const username = String(member.username || '').trim()
+        if (!username) return null
+        const preferredName = String(
+          member.groupNickname ||
+          member.remark ||
+          member.displayName ||
+          member.nickname ||
+          username
+        )
+
+        return {
+          username,
+          displayName: preferredName,
+          avatarUrl: member.avatarUrl,
+          nickname: member.nickname,
+          alias: member.alias,
+          remark: member.remark,
+          groupNickname: member.groupNickname,
+          isOwner: Boolean(member.isOwner),
+          isFriend: Boolean(member.isFriend),
+          messageCount: Number.isFinite(member.messageCount) ? Math.max(0, Math.floor(member.messageCount)) : 0
+        }
+      })
+      .filter((member: GroupPanelMember | null): member is GroupPanelMember => Boolean(member))
+      .sort((a: GroupPanelMember, b: GroupPanelMember) => {
+        const ownerDiff = Number(Boolean(b.isOwner)) - Number(Boolean(a.isOwner))
+        if (ownerDiff !== 0) return ownerDiff
+
+        const friendDiff = Number(b.isFriend) - Number(a.isFriend)
+        if (friendDiff !== 0) return friendDiff
+
+        if (a.messageCount !== b.messageCount) return b.messageCount - a.messageCount
+        return a.displayName.localeCompare(b.displayName, 'zh-Hans-CN')
+      })
+  }, [])
+
+  const updateGroupMembersPanelCache = useCallback((
+    chatroomId: string,
+    members: GroupPanelMember[],
+    includeMessageCounts: boolean
+  ) => {
+    groupMembersPanelCacheRef.current.set(chatroomId, {
+      updatedAt: Date.now(),
+      members,
+      includeMessageCounts
+    })
+    if (groupMembersPanelCacheRef.current.size > 80) {
+      const oldestEntry = Array.from(groupMembersPanelCacheRef.current.entries())
+        .sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0]
+      if (oldestEntry) {
+        groupMembersPanelCacheRef.current.delete(oldestEntry[0])
+      }
+    }
+  }, [])
+
+  const getGroupMembersPanelDataWithTimeout = useCallback(async (
+    chatroomId: string,
+    options: { forceRefresh?: boolean; includeMessageCounts?: boolean },
+    timeoutMs: number
+  ) => {
+    let timeoutTimer: number | null = null
+    try {
+      const timeoutPromise = new Promise<{ success: false; error: string }>((resolve) => {
+        timeoutTimer = window.setTimeout(() => {
+          resolve({ success: false, error: '加载群成员超时，请稍后重试' })
+        }, timeoutMs)
+      })
+      return await Promise.race([
+        window.electronAPI.groupAnalytics.getGroupMembersPanelData(chatroomId, options),
+        timeoutPromise
+      ])
+    } finally {
+      if (timeoutTimer) {
+        window.clearTimeout(timeoutTimer)
+      }
+    }
+  }, [])
+
   const loadGroupMembersPanel = useCallback(async (chatroomId: string) => {
     if (!chatroomId || !isGroupChatSession(chatroomId)) return
 
@@ -1041,14 +1124,52 @@ function ChatPage(_props: ChatPageProps) {
     const cached = groupMembersPanelCacheRef.current.get(chatroomId)
     const cacheFresh = Boolean(cached && now - cached.updatedAt < GROUP_MEMBERS_PANEL_CACHE_TTL_MS)
     const hasCachedMembers = Boolean(cached && cached.members.length > 0)
+    const hasFreshMessageCounts = Boolean(cacheFresh && cached?.includeMessageCounts)
+    let startedBackgroundRefresh = false
+
+    const refreshMessageCountsInBackground = (forceRefresh: boolean) => {
+      startedBackgroundRefresh = true
+      setIsRefreshingGroupMembers(true)
+      void (async () => {
+        try {
+          const countsResult = await getGroupMembersPanelDataWithTimeout(
+            chatroomId,
+            { forceRefresh, includeMessageCounts: true },
+            25000
+          )
+          if (requestSeq !== groupMembersRequestSeqRef.current) return
+          if (!countsResult.success || !Array.isArray(countsResult.data)) {
+            setGroupMembersError('成员列表已加载，发言统计稍后再试')
+            return
+          }
+
+          const membersWithCounts = normalizeGroupPanelMembers(countsResult.data as GroupPanelMember[])
+          setGroupPanelMembers(membersWithCounts)
+          setGroupMembersError(null)
+          updateGroupMembersPanelCache(chatroomId, membersWithCounts, true)
+          hasInitializedGroupMembersRef.current = true
+        } catch {
+          if (requestSeq !== groupMembersRequestSeqRef.current) return
+          setGroupMembersError('成员列表已加载，发言统计稍后再试')
+        } finally {
+          if (requestSeq === groupMembersRequestSeqRef.current) {
+            setIsRefreshingGroupMembers(false)
+          }
+        }
+      })()
+    }
 
     if (cacheFresh && cached) {
       setGroupPanelMembers(cached.members)
       setGroupMembersError(null)
       setGroupMembersLoadingHint('')
-      setIsRefreshingGroupMembers(false)
       setIsLoadingGroupMembers(false)
       hasInitializedGroupMembersRef.current = true
+      if (!hasFreshMessageCounts) {
+        refreshMessageCountsInBackground(false)
+      } else {
+        setIsRefreshingGroupMembers(false)
+      }
       return
     }
 
@@ -1070,7 +1191,11 @@ function ChatPage(_props: ChatPageProps) {
     }
 
     try {
-      const membersResult = await window.electronAPI.groupAnalytics.getGroupMembersPanelData(chatroomId)
+      const membersResult = await getGroupMembersPanelDataWithTimeout(
+        chatroomId,
+        { includeMessageCounts: false, forceRefresh: false },
+        12000
+      )
       if (requestSeq !== groupMembersRequestSeqRef.current) return
 
       if (!membersResult.success || !Array.isArray(membersResult.data)) {
@@ -1081,58 +1206,12 @@ function ChatPage(_props: ChatPageProps) {
         return
       }
 
-      const membersPayload = membersResult.data as GroupPanelMember[]
-      const members: GroupPanelMember[] = membersPayload
-        .map((member: GroupPanelMember): GroupPanelMember | null => {
-          const username = String(member.username || '').trim()
-          if (!username) return null
-          const preferredName = String(
-            member.groupNickname ||
-            member.remark ||
-            member.displayName ||
-            member.nickname ||
-            username
-          )
-
-          return {
-            username,
-            displayName: preferredName,
-            avatarUrl: member.avatarUrl,
-            nickname: member.nickname,
-            alias: member.alias,
-            remark: member.remark,
-            groupNickname: member.groupNickname,
-            isOwner: Boolean(member.isOwner),
-            isFriend: Boolean(member.isFriend),
-            messageCount: Number.isFinite(member.messageCount) ? Math.max(0, Math.floor(member.messageCount)) : 0
-          }
-        })
-        .filter((member: GroupPanelMember | null): member is GroupPanelMember => Boolean(member))
-        .sort((a: GroupPanelMember, b: GroupPanelMember) => {
-          const ownerDiff = Number(Boolean(b.isOwner)) - Number(Boolean(a.isOwner))
-          if (ownerDiff !== 0) return ownerDiff
-
-          const friendDiff = Number(b.isFriend) - Number(a.isFriend)
-          if (friendDiff !== 0) return friendDiff
-
-          if (a.messageCount !== b.messageCount) return b.messageCount - a.messageCount
-          return a.displayName.localeCompare(b.displayName, 'zh-Hans-CN')
-        })
-
+      const members = normalizeGroupPanelMembers(membersResult.data as GroupPanelMember[])
       setGroupPanelMembers(members)
       setGroupMembersError(null)
-      groupMembersPanelCacheRef.current.set(chatroomId, {
-        updatedAt: Date.now(),
-        members
-      })
-      if (groupMembersPanelCacheRef.current.size > 80) {
-        const oldestEntry = Array.from(groupMembersPanelCacheRef.current.entries())
-          .sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0]
-        if (oldestEntry) {
-          groupMembersPanelCacheRef.current.delete(oldestEntry[0])
-        }
-      }
+      updateGroupMembersPanelCache(chatroomId, members, false)
       hasInitializedGroupMembersRef.current = true
+      refreshMessageCountsInBackground(false)
     } catch (e) {
       if (requestSeq !== groupMembersRequestSeqRef.current) return
       if (!hasCachedMembers) {
@@ -1142,11 +1221,18 @@ function ChatPage(_props: ChatPageProps) {
     } finally {
       if (requestSeq === groupMembersRequestSeqRef.current) {
         setIsLoadingGroupMembers(false)
-        setIsRefreshingGroupMembers(false)
         setGroupMembersLoadingHint('')
+        if (!startedBackgroundRefresh) {
+          setIsRefreshingGroupMembers(false)
+        }
       }
     }
-  }, [isGroupChatSession])
+  }, [
+    getGroupMembersPanelDataWithTimeout,
+    isGroupChatSession,
+    normalizeGroupPanelMembers,
+    updateGroupMembersPanelCache
+  ])
 
   const toggleGroupMembersPanel = useCallback(() => {
     if (!currentSessionId || !isGroupChatSession(currentSessionId)) return
@@ -3367,7 +3453,7 @@ function ChatPage(_props: ChatPageProps) {
                   {isRefreshingGroupMembers && (
                     <div className="group-members-status" role="status" aria-live="polite">
                       <Loader2 size={14} className="spin" />
-                      <span>正在更新群成员数据...</span>
+                      <span>正在统计成员发言数...</span>
                     </div>
                   )}
                   {groupMembersError && groupPanelMembers.length > 0 && (

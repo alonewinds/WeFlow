@@ -3250,6 +3250,13 @@ function ExportPage() {
                     const topSessions = isPerfExpanded
                       ? getTaskPerformanceTopSessions(task.performance, nowTick, 5)
                       : []
+                    const normalizedProgressTotal = task.progress.total > 0 ? task.progress.total : 0
+                    const normalizedProgressCurrent = normalizedProgressTotal > 0
+                      ? Math.max(0, Math.min(normalizedProgressTotal, task.progress.current))
+                      : 0
+                    const currentSessionRatio = task.progress.phaseTotal > 0
+                      ? Math.max(0, Math.min(1, task.progress.phaseProgress / task.progress.phaseTotal))
+                      : null
                     return (
                       <div key={task.id} className={`task-card ${task.status} ${task.controlState ? `request-${task.controlState}` : ''}`}>
                         <div className="task-main">
@@ -3263,13 +3270,16 @@ function ExportPage() {
                               <div className="task-progress-bar">
                                 <div
                                   className="task-progress-fill"
-                                  style={{ width: `${task.progress.total > 0 ? (task.progress.current / task.progress.total) * 100 : 0}%` }}
+                                  style={{ width: `${normalizedProgressTotal > 0 ? (normalizedProgressCurrent / normalizedProgressTotal) * 100 : 0}%` }}
                                 />
                               </div>
                               <div className="task-progress-text">
-                                {task.progress.total > 0
-                                  ? `${task.progress.current} / ${task.progress.total}`
+                                {normalizedProgressTotal > 0
+                                  ? `${Math.floor(normalizedProgressCurrent)} / ${normalizedProgressTotal}`
                                   : '处理中'}
+                                {task.status === 'running' && currentSessionRatio !== null
+                                  ? `（当前会话 ${Math.round(currentSessionRatio * 100)}%）`
+                                  : ''}
                                 {task.progress.phaseLabel ? ` · ${task.progress.phaseLabel}` : ''}
                               </div>
                             </>

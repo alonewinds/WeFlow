@@ -237,8 +237,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   groupAnalytics: {
     getGroupChats: () => ipcRenderer.invoke('groupAnalytics:getGroupChats'),
     getGroupMembers: (chatroomId: string) => ipcRenderer.invoke('groupAnalytics:getGroupMembers', chatroomId),
-    getGroupMembersPanelData: (chatroomId: string, forceRefresh?: boolean) =>
-      ipcRenderer.invoke('groupAnalytics:getGroupMembersPanelData', chatroomId, forceRefresh),
+    getGroupMembersPanelData: (
+      chatroomId: string,
+      options?: { forceRefresh?: boolean; includeMessageCounts?: boolean }
+    ) => ipcRenderer.invoke('groupAnalytics:getGroupMembersPanelData', chatroomId, options),
     getGroupMessageRanking: (chatroomId: string, limit?: number, startTime?: number, endTime?: number) => ipcRenderer.invoke('groupAnalytics:getGroupMessageRanking', chatroomId, limit, startTime, endTime),
     getGroupActiveHours: (chatroomId: string, startTime?: number, endTime?: number) => ipcRenderer.invoke('groupAnalytics:getGroupActiveHours', chatroomId, startTime, endTime),
     getGroupMediaStats: (chatroomId: string, startTime?: number, endTime?: number) => ipcRenderer.invoke('groupAnalytics:getGroupMediaStats', chatroomId, startTime, endTime),

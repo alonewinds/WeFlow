@@ -351,7 +351,10 @@ export interface ElectronAPI {
       }>
       error?: string
     }>
-    getGroupMembersPanelData: (chatroomId: string, forceRefresh?: boolean) => Promise<{
+    getGroupMembersPanelData: (
+      chatroomId: string,
+      options?: { forceRefresh?: boolean; includeMessageCounts?: boolean }
+    ) => Promise<{
       success: boolean
       data?: Array<{
         username: string

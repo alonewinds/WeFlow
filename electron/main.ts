@@ -100,6 +100,7 @@ interface ExportTaskControlState {
 }
 
 const exportTaskControlMap = new Map<string, ExportTaskControlState>()
+const pendingExportTaskControlMap = new Map<string, ExportTaskControlState>()
 
 const getTaskControlState = (taskId?: string): ExportTaskControlState | null => {
   const normalized = typeof taskId === 'string' ? taskId.trim() : ''
@@ -110,7 +111,12 @@ const getTaskControlState = (taskId?: string): ExportTaskControlState | null => 
 const createTaskControlState = (taskId?: string): string | null => {
   const normalized = typeof taskId === 'string' ? taskId.trim() : ''
   if (!normalized) return null
-  exportTaskControlMap.set(normalized, { pauseRequested: false, stopRequested: false })
+  const pending = pendingExportTaskControlMap.get(normalized)
+  exportTaskControlMap.set(normalized, {
+    pauseRequested: Boolean(pending?.pauseRequested),
+    stopRequested: Boolean(pending?.stopRequested)
+  })
+  pendingExportTaskControlMap.delete(normalized)
   return normalized
 }
 
@@ -118,6 +124,16 @@ const clearTaskControlState = (taskId?: string): void => {
   const normalized = typeof taskId === 'string' ? taskId.trim() : ''
   if (!normalized) return
   exportTaskControlMap.delete(normalized)
+  pendingExportTaskControlMap.delete(normalized)
+}
+
+const queueTaskControlRequest = (taskId: string, action: 'pause' | 'stop'): void => {
+  const normalized = taskId.trim()
+  if (!normalized) return
+  const existing = pendingExportTaskControlMap.get(normalized) || { pauseRequested: false, stopRequested: false }
+  if (action === 'pause') existing.pauseRequested = true
+  if (action === 'stop') existing.stopRequested = true
+  pendingExportTaskControlMap.set(normalized, existing)
 }
 
 function createWindow(options: { autoShow?: boolean } = {}) {
@@ -1297,7 +1313,8 @@ function registerIpcHandlers() {
   ipcMain.handle('export:pauseTask', async (_, taskId: string) => {
     const state = getTaskControlState(taskId)
     if (!state) {
-      return { success: false, error: '任务未在执行中或已结束' }
+      queueTaskControlRequest(taskId, 'pause')
+      return { success: true, queued: true }
     }
     state.pauseRequested = true
     return { success: true }
@@ -1306,7 +1323,8 @@ function registerIpcHandlers() {
   ipcMain.handle('export:stopTask', async (_, taskId: string) => {
     const state = getTaskControlState(taskId)
     if (!state) {
-      return { success: false, error: '任务未在执行中或已结束' }
+      queueTaskControlRequest(taskId, 'stop')
+      return { success: true, queued: true }
     }
     state.stopRequested = true
     return { success: true }
@@ -1398,8 +1416,15 @@ function registerIpcHandlers() {
     return groupAnalyticsService.getGroupMembers(chatroomId)
   })
 
-  ipcMain.handle('groupAnalytics:getGroupMembersPanelData', async (_, chatroomId: string, forceRefresh?: boolean) => {
-    return groupAnalyticsService.getGroupMembersPanelData(chatroomId, forceRefresh)
+  ipcMain.handle(
+    'groupAnalytics:getGroupMembersPanelData',
+    async (_, chatroomId: string, options?: { forceRefresh?: boolean; includeMessageCounts?: boolean } | boolean) => {
+      const normalizedOptions = typeof options === 'boolean'
+        ? { forceRefresh: options }
+        : options
+      return groupAnalyticsService.getGroupMembersPanelData(chatroomId, normalizedOptions)
+    }
+  )
   })
 
   ipcMain.handle('groupAnalytics:getGroupMessageRanking', async (_, chatroomId: string, limit?: number, startTime?: number, endTime?: number) => {
