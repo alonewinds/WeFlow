@@ -1016,7 +1016,10 @@
 
 .export-session-detail-overlay {
   position: fixed;
-  inset: 0;
+  top: 40px;
+  right: 0;
+  bottom: 0;
+  left: 0;
   z-index: 1100;
   display: flex;
   justify-content: flex-end;
@@ -1025,7 +1028,7 @@
 
 .export-session-detail-panel {
   width: min(360px, calc(100vw - 16px));
-  height: 100vh;
+  height: calc(100vh - 40px);
   border-left: 1px solid var(--border-color);
   border-radius: 0;
   background: var(--card-bg);
