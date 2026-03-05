@@ -7,6 +7,7 @@ import {
   Calendar,
   Check,
   CheckSquare,
+  CircleHelp,
   Copy,
   Database,
   Download,
@@ -797,6 +798,63 @@ const WriteLayoutSelector = memo(function WriteLayoutSelector({
           </button>
         ))}
       </div>
+    </div>
+  )
+})
+
+const SectionInfoTooltip = memo(function SectionInfoTooltip({
+  label,
+  heading,
+  messages
+}: {
+  label: string
+  heading: string
+  messages: string[]
+}) {
+  const [isOpen, setIsOpen] = useState(false)
+  const containerRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!isOpen) return
+
+    const handleOutsideClick = (event: MouseEvent) => {
+      if (containerRef.current?.contains(event.target as Node)) return
+      setIsOpen(false)
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleOutsideClick)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [isOpen])
+
+  return (
+    <div className="section-info-tooltip" ref={containerRef}>
+      <button
+        type="button"
+        className={`section-info-trigger ${isOpen ? 'active' : ''}`}
+        onClick={() => setIsOpen(prev => !prev)}
+        aria-label={`查看${label}说明`}
+        aria-expanded={isOpen}
+      >
+        <CircleHelp size={14} />
+      </button>
+      {isOpen && (
+        <div className="section-info-popover" role="dialog" aria-label={`${label}说明`}>
+          <h4>{heading}</h4>
+          {messages.map(message => (
+            <p key={message}>{message}</p>
+          ))}
+        </div>
+      )}
     </div>
   )
 })
@@ -3700,6 +3758,17 @@ function ExportPage() {
         onTogglePerfTask={toggleTaskPerfDetail}
       />
 
+      <div className="export-section-title-row">
+        <h3 className="export-section-title">按类型批量导出</h3>
+        <SectionInfoTooltip
+          label="按类型批量导出"
+          heading="按类型批量导出说明"
+          messages={[
+            '按数据类型统一导出，适合横向汇总同类内容，比如集中导出图片、语音或视频。',
+            '发起前可先设置导出时间范围和格式，能减少无关数据，导出结果更聚焦。'
+          ]}
+        />
+      </div>
       <div className="content-card-grid">
         {contentCards.map(card => {
           const Icon = card.icon
@@ -3758,6 +3827,17 @@ function ExportPage() {
         })}
       </div>
 
+      <div className="export-section-title-row">
+        <h3 className="export-section-title">按会话批量导出</h3>
+        <SectionInfoTooltip
+          label="按会话批量导出"
+          heading="按会话批量导出说明"
+          messages={[
+            '按会话维度导出完整上下文，适合按客户、项目或群组进行归档。',
+            '你可以先在列表中筛选目标会话，再批量导出，结果会保留每个会话的结构与时间线。'
+          ]}
+        />
+      </div>
       <div className="session-table-section">
         <div className="table-toolbar">
           <div className="table-tabs" role="tablist" aria-label="会话类型">
