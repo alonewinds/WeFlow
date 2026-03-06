@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react'
 import { RefreshCw, Search, X, Download, FolderOpen, FileJson, FileText, Image, CheckCircle, AlertCircle, Calendar, Users, Info, ChevronLeft, ChevronRight, Shield, ShieldOff, Loader2 } from 'lucide-react'
-import JumpToDateDialog from '../components/JumpToDateDialog'
 import './SnsPage.scss'
 import { SnsPost } from '../types/sns'
 import { SnsPostItem } from '../components/Sns/SnsPostItem'
@@ -118,7 +117,6 @@ export default function SnsPage() {
     })
 
     // UI states
-    const [showJumpDialog, setShowJumpDialog] = useState(false)
     const [debugPost, setDebugPost] = useState<SnsPost | null>(null)
     const [authorTimelineTarget, setAuthorTimelineTarget] = useState<ContactSnsTimelineTarget | null>(null)
 
@@ -1114,7 +1112,6 @@ export default function SnsPage() {
                 setSearchKeyword={setSearchKeyword}
                 jumpTargetDate={jumpTargetDate}
                 setJumpTargetDate={setJumpTargetDate}
-                onOpenJumpDialog={() => setShowJumpDialog(true)}
                 selectedUsernames={selectedUsernames}
                 setSelectedUsernames={setSelectedUsernames}
                 contacts={contacts}
@@ -1125,16 +1122,6 @@ export default function SnsPage() {
             />
 
             {/* Dialogs and Overlays */}
-            <JumpToDateDialog
-                isOpen={showJumpDialog}
-                onClose={() => setShowJumpDialog(false)}
-                onSelect={(date) => {
-                    setJumpTargetDate(date)
-                    setShowJumpDialog(false)
-                }}
-                currentDate={jumpTargetDate || new Date()}
-            />
-
             <ContactSnsTimelineDialog
                 target={authorTimelineTarget}
                 onClose={closeAuthorTimeline}

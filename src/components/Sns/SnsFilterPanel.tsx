@@ -1,7 +1,7 @@
-import React from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { Search, Calendar, User, X, Loader2 } from 'lucide-react'
 import { Avatar } from '../Avatar'
-// import JumpToDateDialog from '../JumpToDateDialog' // Assuming this is imported from parent or moved
+import JumpToDatePopover from '../JumpToDatePopover'
 
 interface Contact {
     username: string
@@ -22,7 +22,6 @@ interface SnsFilterPanelProps {
     setSearchKeyword: (val: string) => void
     jumpTargetDate?: Date
     setJumpTargetDate: (date?: Date) => void
-    onOpenJumpDialog: () => void
     selectedUsernames: string[]
     setSelectedUsernames: (val: string[]) => void
     contacts: Contact[]
@@ -37,7 +36,6 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
     setSearchKeyword,
     jumpTargetDate,
     setJumpTargetDate,
-    onOpenJumpDialog,
     selectedUsernames,
     setSelectedUsernames,
     contacts,
@@ -46,6 +44,19 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
     loading,
     contactsCountProgress
 }) => {
+    const [showJumpPopover, setShowJumpPopover] = useState(false)
+    const jumpCalendarWrapRef = useRef<HTMLDivElement | null>(null)
+
+    useEffect(() => {
+        if (!showJumpPopover) return
+        const handleClickOutside = (event: MouseEvent) => {
+            if (!jumpCalendarWrapRef.current) return
+            if (jumpCalendarWrapRef.current.contains(event.target as Node)) return
+            setShowJumpPopover(false)
+        }
+        document.addEventListener('mousedown', handleClickOutside)
+        return () => document.removeEventListener('mousedown', handleClickOutside)
+    }, [showJumpPopover])
 
     const filteredContacts = contacts.filter(c =>
         (c.displayName || '').toLowerCase().includes(contactSearch.toLowerCase()) ||
@@ -116,27 +127,35 @@ export const SnsFilterPanel: React.FC<SnsFilterPanelProps> = ({
                         <Calendar size={14} />
                         <span>时间跳转</span>
                     </div>
-                    <button
-                        className={`date-picker-trigger ${jumpTargetDate ? 'active' : ''}`}
-                        onClick={onOpenJumpDialog}
-                    >
-                        <span className="date-text">
-                            {jumpTargetDate
-                                ? jumpTargetDate.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })
-                                : '选择日期...'}
-                        </span>
-                        {jumpTargetDate && (
-                            <div
-                                className="clear-date-btn"
-                                onClick={(e) => {
-                                    e.stopPropagation()
-                                    setJumpTargetDate(undefined)
-                                }}
-                            >
-                                <X size={12} />
-                            </div>
-                        )}
-                    </button>
+                    <div className="jump-calendar-anchor" ref={jumpCalendarWrapRef}>
+                        <button
+                            className={`date-picker-trigger ${jumpTargetDate ? 'active' : ''}`}
+                            onClick={() => setShowJumpPopover(prev => !prev)}
+                        >
+                            <span className="date-text">
+                                {jumpTargetDate
+                                    ? jumpTargetDate.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })
+                                    : '选择日期...'}
+                            </span>
+                            {jumpTargetDate && (
+                                <div
+                                    className="clear-date-btn"
+                                    onClick={(e) => {
+                                        e.stopPropagation()
+                                        setJumpTargetDate(undefined)
+                                    }}
+                                >
+                                    <X size={12} />
+                                </div>
+                            )}
+                        </button>
+                        <JumpToDatePopover
+                            isOpen={showJumpPopover}
+                            currentDate={jumpTargetDate || new Date()}
+                            onClose={() => setShowJumpPopover(false)}
+                            onSelect={(date) => setJumpTargetDate(date)}
+                        />
+                    </div>
                 </div>
 
                 {/* Contact Widget */}
