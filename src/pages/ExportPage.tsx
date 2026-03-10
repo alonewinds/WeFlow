@@ -6008,7 +6008,7 @@ function ExportPage() {
                     })
                   }}
                 >
-                  {!canExport ? '暂无会话' : isRunning ? '导出中...' : isQueued ? '排队中' : '单会话导出'}
+                  {!canExport ? '暂无会话' : isRunning ? '导出中...' : isQueued ? '排队中' : '导出'}
                 </button>
                 {hasRecentExport && <span className="row-export-time">{recentExportTime}</span>}
               </div>
