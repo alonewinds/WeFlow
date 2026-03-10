@@ -1,7 +1,7 @@
 /* Global Variables */
 :root {
     --sns-max-width: 800px;
-    --sns-panel-width: 320px;
+    --sns-panel-width: 380px;
     --sns-bg-color: var(--bg-primary);
     --sns-card-bg: var(--bg-secondary);
     --sns-border-radius-lg: 16px;
@@ -261,6 +261,48 @@
     min-height: 0;
     overflow-y: auto;
     padding-top: 16px;
+}
+
+.feed-contact-filter-bar {
+    margin: 10px 4px 0;
+    padding: 10px 12px;
+    border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border-color));
+    border-radius: 12px;
+    background: rgba(var(--primary-rgb), 0.08);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+
+    .feed-contact-filter-label {
+        font-size: 12px;
+        color: var(--text-secondary);
+        white-space: nowrap;
+    }
+
+    .feed-contact-filter-summary {
+        font-size: 13px;
+        color: var(--text-primary);
+        font-weight: 600;
+        min-width: 0;
+    }
+
+    .feed-contact-filter-clear {
+        margin-left: auto;
+        border: none;
+        background: transparent;
+        color: var(--primary);
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        padding: 0;
+        white-space: nowrap;
+
+        &:hover {
+            text-decoration: underline;
+            text-underline-offset: 2px;
+        }
+    }
 }
 
 .posts-list {

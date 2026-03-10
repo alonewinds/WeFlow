@@ -173,9 +173,11 @@ export default function SnsPage() {
     const overviewStatsStatusRef = useRef<OverviewStatsStatus>(overviewStatsStatus)
     const searchKeywordRef = useRef(searchKeyword)
     const jumpTargetDateRef = useRef<Date | undefined>(jumpTargetDate)
+    const selectedContactUsernamesRef = useRef<string[]>(selectedContactUsernames)
     const cacheScopeKeyRef = useRef('')
     const snsUserPostCountsCacheScopeKeyRef = useRef('')
     const scrollAdjustmentRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
+    const pendingResetFeedRef = useRef(false)
     const contactsLoadTokenRef = useRef(0)
     const contactsCountHydrationTokenRef = useRef(0)
     const contactsCountBatchTimerRef = useRef<number | null>(null)
@@ -208,6 +210,9 @@ export default function SnsPage() {
     useEffect(() => {
         jumpTargetDateRef.current = jumpTargetDate
     }, [jumpTargetDate])
+    useEffect(() => {
+        selectedContactUsernamesRef.current = selectedContactUsernames
+    }, [selectedContactUsernames])
     useEffect(() => {
         if (!showJumpPopover) {
             setJumpPopoverDate(jumpTargetDate || new Date())
@@ -394,6 +399,14 @@ export default function SnsPage() {
         return `${names.slice(0, 2).join('、')} 等 ${names.length} 位联系人`
     }, [contacts, exportScope])
 
+    const selectedFeedContactsSummary = useMemo(() => {
+        if (selectedContactUsernames.length === 0) return ''
+        const contactMap = new Map(contacts.map((contact) => [contact.username, contact]))
+        const names = selectedContactUsernames.map((username) => contactMap.get(username)?.displayName || username)
+        if (names.length <= 2) return names.join('、')
+        return `${names.slice(0, 2).join('、')} 等 ${names.length} 人`
+    }, [contacts, selectedContactUsernames])
+
     const myTimelineCount = useMemo(() => {
         if (resolvedCurrentUserContact?.postCountStatus === 'ready' && typeof resolvedCurrentUserContact.postCount === 'number') {
             return normalizePostCount(resolvedCurrentUserContact.postCount)
@@ -421,7 +434,11 @@ export default function SnsPage() {
     }, [currentUserProfile.avatarUrl, currentUserProfile.displayName, resolvedCurrentUserContact])
 
     const isDefaultViewNow = useCallback(() => {
-        return !searchKeywordRef.current.trim() && !jumpTargetDateRef.current
+        return (
+            !searchKeywordRef.current.trim() &&
+            !jumpTargetDateRef.current &&
+            selectedContactUsernamesRef.current.length === 0
+        )
     }, [])
 
     const ensureSnsCacheScopeKey = useCallback(async () => {
@@ -594,7 +611,12 @@ export default function SnsPage() {
 
     const loadPosts = useCallback(async (options: { reset?: boolean, direction?: 'older' | 'newer' } = {}) => {
         const { reset = false, direction = 'older' } = options
-        if (loadingRef.current) return
+        if (loadingRef.current) {
+            if (reset) {
+                pendingResetFeedRef.current = true
+            }
+            return
+        }
 
         loadingRef.current = true
         if (direction === 'newer') setLoadingNewer(true)
@@ -602,6 +624,7 @@ export default function SnsPage() {
 
         try {
             const limit = 20
+            const selectedUsernames = selectedContactUsernames.length > 0 ? selectedContactUsernames : undefined
             let startTs: number | undefined = undefined
             let endTs: number | undefined = undefined
 
@@ -618,7 +641,7 @@ export default function SnsPage() {
                     const result = await window.electronAPI.sns.getTimeline(
                         limit,
                         0,
-                        undefined,
+                        selectedUsernames,
                         searchKeyword,
                         topTs + 1,
                         undefined
@@ -659,7 +682,7 @@ export default function SnsPage() {
             const result = await window.electronAPI.sns.getTimeline(
                 limit,
                 0,
-                undefined,
+                selectedUsernames,
                 searchKeyword,
                 startTs, // default undefined
                 endTs
@@ -674,7 +697,7 @@ export default function SnsPage() {
                     // Check for newer items above topTs
                     const topTs = result.timeline[0]?.createTime || 0;
                     if (topTs > 0) {
-                        const checkResult = await window.electronAPI.sns.getTimeline(1, 0, undefined, searchKeyword, topTs + 1, undefined);
+                        const checkResult = await window.electronAPI.sns.getTimeline(1, 0, selectedUsernames, searchKeyword, topTs + 1, undefined);
                         setHasNewer(!!(checkResult.success && checkResult.timeline && checkResult.timeline.length > 0));
                     } else {
                         setHasNewer(false);
@@ -700,8 +723,12 @@ export default function SnsPage() {
             setLoading(false)
             setLoadingNewer(false)
             loadingRef.current = false
+            if (pendingResetFeedRef.current) {
+                pendingResetFeedRef.current = false
+                void loadPosts({ reset: true })
+            }
         }
-    }, [jumpTargetDate, persistSnsPageCache, searchKeyword])
+    }, [jumpTargetDate, persistSnsPageCache, searchKeyword, selectedContactUsernames])
 
     const stopContactsCountHydration = useCallback((resetProgress = false) => {
         contactsCountHydrationTokenRef.current += 1
@@ -1155,6 +1182,7 @@ export default function SnsPage() {
             stopContactsCountHydration(true)
             setContacts([])
             setPosts([]); setHasMore(true); setHasNewer(false);
+            setSelectedContactUsernames([])
             setSearchKeyword(''); setJumpTargetDate(undefined);
             void hydrateSnsPageCache()
             loadContacts();
@@ -1171,6 +1199,21 @@ export default function SnsPage() {
         }, 500)
         return () => clearTimeout(timer)
     }, [searchKeyword, jumpTargetDate, loadPosts])
+
+    const selectedContactUsernamesKey = useMemo(
+        () => selectedContactUsernames.join('||'),
+        [selectedContactUsernames]
+    )
+
+    const hasInitializedSelectedFeedFilterRef = useRef(false)
+
+    useEffect(() => {
+        if (!hasInitializedSelectedFeedFilterRef.current) {
+            hasInitializedSelectedFeedFilterRef.current = true
+            return
+        }
+        loadPosts({ reset: true })
+    }, [loadPosts, selectedContactUsernamesKey])
 
     const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
         const { scrollTop, clientHeight, scrollHeight } = e.currentTarget
@@ -1334,6 +1377,20 @@ export default function SnsPage() {
                         </div>
                     </div>
 
+                    {selectedContactUsernames.length > 0 && (
+                        <div className="feed-contact-filter-bar">
+                            <span className="feed-contact-filter-label">仅显示</span>
+                            <span className="feed-contact-filter-summary">{selectedFeedContactsSummary} 的动态</span>
+                            <button
+                                type="button"
+                                className="feed-contact-filter-clear"
+                                onClick={clearSelectedContacts}
+                            >
+                                清空筛选
+                            </button>
+                        </div>
+                    )}
+
                     <div className="sns-posts-scroll" onScroll={handleScroll} onWheel={handleWheel} ref={postsContainerRef}>
                         {loadingNewer && (
                             <div className="status-indicator loading-newer">
@@ -1391,9 +1448,11 @@ export default function SnsPage() {
                             <div className="no-results">
                                 <div className="no-results-icon"><Search size={48} /></div>
                                 <p>未找到相关动态</p>
-                                {(searchKeyword || jumpTargetDate) && (
+                                {(searchKeyword || jumpTargetDate || selectedContactUsernames.length > 0) && (
                                     <button onClick={() => {
-                                        setSearchKeyword(''); setJumpTargetDate(undefined);
+                                        setSearchKeyword('')
+                                        setJumpTargetDate(undefined)
+                                        clearSelectedContacts()
                                     }} className="reset-inline">
                                         重置筛选条件
                                     </button>
