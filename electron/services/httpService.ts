@@ -340,6 +340,7 @@ class HttpService {
         const trimmedRows = allRows.slice(0, limit)
         const finalHasMore = hasMore || allRows.length > limit
         const messages = chatService.mapRowsToMessagesForApi(trimmedRows)
+        await this.backfillMissingSenderUsernames(talker, messages)
         return { success: true, messages, hasMore: finalHasMore }
       } finally {
         await wcdbService.closeMessageCursor(cursor)
@@ -357,6 +358,41 @@ class HttpService {
     const parsed = parseInt(value || '', 10)
     if (!Number.isFinite(parsed)) return defaultValue
     return Math.min(Math.max(parsed, min), max)
+  }
+
+  private async backfillMissingSenderUsernames(talker: string, messages: Message[]): Promise<void> {
+    if (!talker.endsWith('@chatroom')) return
+
+    const targets = messages.filter((msg) => !String(msg.senderUsername || '').trim())
+    if (targets.length === 0) return
+
+    const myWxid = (this.configService.get('myWxid') || '').trim()
+    for (const msg of targets) {
+      const localId = Number(msg.localId || 0)
+      if (Number.isFinite(localId) && localId > 0) {
+        try {
+          const detail = await wcdbService.getMessageById(talker, localId)
+          if (detail.success && detail.message) {
+            const hydrated = chatService.mapRowsToMessagesForApi([detail.message])[0]
+            if (hydrated?.senderUsername) {
+              msg.senderUsername = hydrated.senderUsername
+            }
+            if ((msg.isSend === null || msg.isSend === undefined) && hydrated?.isSend !== undefined) {
+              msg.isSend = hydrated.isSend
+            }
+            if (!msg.rawContent && hydrated?.rawContent) {
+              msg.rawContent = hydrated.rawContent
+            }
+          }
+        } catch (error) {
+          console.warn('[HttpService] backfill sender failed:', error)
+        }
+      }
+
+      if (!msg.senderUsername && msg.isSend === 1 && myWxid) {
+        msg.senderUsername = myWxid
+      }
+    }
   }
 
   private parseBooleanParam(url: URL, keys: string[], defaultValue: boolean = false): boolean {
@@ -762,6 +798,20 @@ class HttpService {
     return 0
   }
 
+  private normalizeAccountId(value: string): string {
+    const trimmed = String(value || '').trim()
+    if (!trimmed) return trimmed
+
+    if (trimmed.toLowerCase().startsWith('wxid_')) {
+      const match = trimmed.match(/^(wxid_[^_]+)/i)
+      if (match) return match[1]
+      return trimmed
+    }
+
+    const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+    return suffixMatch ? suffixMatch[1] : trimmed
+  }
+
   /**
    * 获取显示名称
    */
@@ -778,6 +828,105 @@ class HttpService {
     return {}
   }
 
+  private async getAvatarUrls(usernames: string[]): Promise<Record<string, string>> {
+    const lookupUsernames = Array.from(new Set(
+      usernames.flatMap((username) => {
+        const normalized = String(username || '').trim()
+        if (!normalized) return []
+        const cleaned = this.normalizeAccountId(normalized)
+        return cleaned && cleaned !== normalized ? [normalized, cleaned] : [normalized]
+      })
+    ))
+
+    if (lookupUsernames.length === 0) return {}
+
+    try {
+      const result = await wcdbService.getAvatarUrls(lookupUsernames)
+      if (result.success && result.map) {
+        const avatarMap: Record<string, string> = {}
+        for (const [username, avatarUrl] of Object.entries(result.map)) {
+          const normalizedUsername = String(username || '').trim()
+          const normalizedAvatarUrl = String(avatarUrl || '').trim()
+          if (!normalizedUsername || !normalizedAvatarUrl) continue
+
+          avatarMap[normalizedUsername] = normalizedAvatarUrl
+          avatarMap[normalizedUsername.toLowerCase()] = normalizedAvatarUrl
+
+          const cleaned = this.normalizeAccountId(normalizedUsername)
+          if (cleaned) {
+            avatarMap[cleaned] = normalizedAvatarUrl
+            avatarMap[cleaned.toLowerCase()] = normalizedAvatarUrl
+          }
+        }
+        return avatarMap
+      }
+    } catch (e) {
+      console.error('[HttpService] Failed to get avatar urls:', e)
+    }
+
+    return {}
+  }
+
+  private resolveAvatarUrl(avatarMap: Record<string, string>, candidates: Array<string | undefined | null>): string | undefined {
+    for (const candidate of candidates) {
+      const normalized = String(candidate || '').trim()
+      if (!normalized) continue
+
+      const cleaned = this.normalizeAccountId(normalized)
+      const avatarUrl = avatarMap[normalized]
+        || avatarMap[normalized.toLowerCase()]
+        || avatarMap[cleaned]
+        || avatarMap[cleaned.toLowerCase()]
+
+      if (avatarUrl) return avatarUrl
+    }
+
+    return undefined
+  }
+
+  private lookupGroupNickname(groupNicknamesMap: Map<string, string>, sender: string): string {
+    if (!sender) return ''
+    return groupNicknamesMap.get(sender) || groupNicknamesMap.get(sender.toLowerCase()) || ''
+  }
+
+  private resolveChatLabSenderInfo(
+    msg: Message,
+    talkerId: string,
+    talkerName: string,
+    myWxid: string,
+    isGroup: boolean,
+    senderNames: Record<string, string>,
+    groupNicknamesMap: Map<string, string>
+  ): { sender: string; accountName: string; groupNickname?: string } {
+    let sender = String(msg.senderUsername || '').trim()
+    let usedUnknownPlaceholder = false
+    const sameAsMe = sender && myWxid && sender.toLowerCase() === myWxid.toLowerCase()
+    const isSelf = msg.isSend === 1 || sameAsMe
+
+    if (!sender && isSelf && myWxid) {
+      sender = myWxid
+    }
+
+    if (!sender) {
+      if (msg.localType === 10000 || msg.localType === 266287972401) {
+        sender = talkerId
+      } else {
+        sender = `unknown_sender_${msg.localId || msg.createTime || 0}`
+        usedUnknownPlaceholder = true
+      }
+    }
+
+    const groupNickname = isGroup ? this.lookupGroupNickname(groupNicknamesMap, sender) : ''
+    const displayName = senderNames[sender] || groupNickname || (usedUnknownPlaceholder ? '' : sender)
+    const accountName = isSelf ? '我' : (displayName || '未知发送者')
+
+    return {
+      sender,
+      accountName,
+      groupNickname: groupNickname || undefined
+    }
+  }
+
   /**
    * 转换为 ChatLab 格式
    */
@@ -789,6 +938,7 @@ class HttpService {
   ): Promise<ChatLabData> {
     const isGroup = talkerId.endsWith('@chatroom')
     const myWxid = this.configService.get('myWxid') || ''
+    const normalizedMyWxid = this.normalizeAccountId(myWxid).toLowerCase()
 
     // 收集所有发送者
     const senderSet = new Set<string>()
@@ -817,36 +967,45 @@ class HttpService {
     // 构建成员列表
     const memberMap = new Map<string, ChatLabMember>()
     for (const msg of messages) {
-      const sender = msg.senderUsername || ''
-      if (sender && !memberMap.has(sender)) {
-        const displayName = senderNames[sender] || sender
-        const isSelf = sender === myWxid || sender.toLowerCase() === myWxid.toLowerCase()
-        // 获取群昵称（尝试多种方式）
-        const groupNickname = isGroup 
-          ? (groupNicknamesMap.get(sender) || groupNicknamesMap.get(sender.toLowerCase()) || '')
-          : ''
-        memberMap.set(sender, {
-          platformId: sender,
-          accountName: isSelf ? '我' : displayName,
-          groupNickname: groupNickname || undefined
+      const senderInfo = this.resolveChatLabSenderInfo(msg, talkerId, talkerName, myWxid, isGroup, senderNames, groupNicknamesMap)
+      if (!memberMap.has(senderInfo.sender)) {
+        memberMap.set(senderInfo.sender, {
+          platformId: senderInfo.sender,
+          accountName: senderInfo.accountName,
+          groupNickname: senderInfo.groupNickname
         })
+      }
+    }
+
+    const [memberAvatarMap, myAvatarResult, sessionAvatarInfo] = await Promise.all([
+      this.getAvatarUrls(Array.from(memberMap.keys()).filter((sender) => !sender.startsWith('unknown_sender_'))),
+      myWxid
+        ? chatService.getMyAvatarUrl()
+        : Promise.resolve<{ success: boolean; avatarUrl?: string }>({ success: true }),
+      isGroup ? chatService.getContactAvatar(talkerId) : Promise.resolve(null)
+    ])
+
+    for (const [sender, member] of memberMap.entries()) {
+      if (sender.startsWith('unknown_sender_')) continue
+
+      const normalizedSender = this.normalizeAccountId(sender).toLowerCase()
+      const isSelfMember = Boolean(normalizedMyWxid && normalizedSender && normalizedSender === normalizedMyWxid)
+      const avatarUrl = (isSelfMember ? myAvatarResult.avatarUrl : undefined)
+        || this.resolveAvatarUrl(memberAvatarMap, isSelfMember ? [sender, myWxid] : [sender])
+
+      if (avatarUrl) {
+        member.avatar = avatarUrl
       }
     }
 
     // 转换消息
     const chatLabMessages: ChatLabMessage[] = messages.map(msg => {
-      const sender = msg.senderUsername || ''
-      const isSelf = msg.isSend === 1 || sender === myWxid
-      const accountName = isSelf ? '我' : (senderNames[sender] || sender)
-      // 获取该发送者的群昵称
-      const groupNickname = isGroup 
-        ? (groupNicknamesMap.get(sender) || groupNicknamesMap.get(sender.toLowerCase()) || '')
-        : ''
+      const senderInfo = this.resolveChatLabSenderInfo(msg, talkerId, talkerName, myWxid, isGroup, senderNames, groupNicknamesMap)
 
       return {
-        sender,
-        accountName,
-        groupNickname: groupNickname || undefined,
+        sender: senderInfo.sender,
+        accountName: senderInfo.accountName,
+        groupNickname: senderInfo.groupNickname,
         timestamp: msg.createTime,
         type: this.mapMessageType(msg.localType, msg),
         content: this.getMessageContent(msg),
@@ -866,6 +1025,7 @@ class HttpService {
         platform: 'wechat',
         type: isGroup ? 'group' : 'private',
         groupId: isGroup ? talkerId : undefined,
+        groupAvatar: isGroup ? sessionAvatarInfo?.avatarUrl : undefined,
         ownerId: myWxid || undefined
       },
       members: Array.from(memberMap.values()),

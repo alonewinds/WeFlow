@@ -136,7 +136,7 @@ export class WcdbService {
    */
   setMonitor(callback: (type: string, json: string) => void): void {
     this.monitorListener = callback;
-    this.callWorker('setMonitor').catch(() => { });
+    this.callWorker<{ success?: boolean }>('setMonitor').catch(() => { });
   }
 
   /**
@@ -174,10 +174,10 @@ export class WcdbService {
   /**
    * 关闭服务
    */
-  shutdown(): void {
-    this.close()
+  async shutdown(): Promise<void> {
+    try { await this.close() } catch {}
     if (this.worker) {
-      this.worker.terminate()
+      try { await this.worker.terminate() } catch {}
       this.worker = null
     }
   }

@@ -1,5 +1,5 @@
 import './preload-env'
-import { app, BrowserWindow, ipcMain, nativeTheme, session } from 'electron'
+import { app, BrowserWindow, ipcMain, nativeTheme, session, Tray, Menu, nativeImage } from 'electron'
 import { Worker } from 'worker_threads'
 import { join, dirname } from 'path'
 import { autoUpdater } from 'electron-updater'
@@ -96,6 +96,7 @@ const keyService = process.platform === 'darwin'
 let mainWindowReady = false
 let shouldShowMain = true
 let isAppQuitting = false
+let tray: Tray | null = null
 
 // 更新下载状态管理（Issue #294 修复）
 let isDownloadInProgress = false
@@ -235,13 +236,32 @@ const isYearsLoadCanceled = (taskId: string): boolean => {
   return task?.canceled === true
 }
 
+const setupCustomTitleBarWindow = (win: BrowserWindow): void => {
+  if (process.platform === 'darwin') {
+    win.setWindowButtonVisibility(false)
+  }
+
+  const emitMaximizeState = () => {
+    if (win.isDestroyed()) return
+    win.webContents.send('window:maximizeStateChanged', win.isMaximized() || win.isFullScreen())
+  }
+
+  win.on('maximize', emitMaximizeState)
+  win.on('unmaximize', emitMaximizeState)
+  win.on('enter-full-screen', emitMaximizeState)
+  win.on('leave-full-screen', emitMaximizeState)
+  win.webContents.on('did-finish-load', emitMaximizeState)
+}
+
 function createWindow(options: { autoShow?: boolean } = {}) {
   // 获取图标路径 - 打包后在 resources 目录
   const { autoShow = true } = options
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   const win = new BrowserWindow({
     width: 1400,
@@ -256,13 +276,10 @@ function createWindow(options: { autoShow?: boolean } = {}) {
       webSecurity: false // Allow loading local files (video playback)
     },
     titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: '#00000000',
-      symbolColor: '#1a1a1a',
-      height: 40
-    },
+    titleBarOverlay: false,
     show: false
   })
+  setupCustomTitleBarWindow(win)
 
   // 窗口准备好后显示
   // Splash 模式下不在这里 show，由启动流程统一控制
@@ -336,6 +353,13 @@ function createWindow(options: { autoShow?: boolean } = {}) {
     callback(false)
   })
 
+  win.on('close', (e) => {
+    if (isAppQuitting) return
+    // 关闭主窗口时隐藏到状态栏而不是退出
+    e.preventDefault()
+    win.hide()
+  })
+
   win.on('closed', () => {
     if (mainWindow !== win) return
 
@@ -343,7 +367,6 @@ function createWindow(options: { autoShow?: boolean } = {}) {
     mainWindowReady = false
 
     if (process.platform !== 'darwin' && !isAppQuitting) {
-      // 隐藏通知窗也是 BrowserWindow，必须销毁，否则会阻止应用退出。
       destroyNotificationWindow()
       if (BrowserWindow.getAllWindows().length === 0) {
         app.quit()
@@ -367,7 +390,9 @@ function createAgreementWindow() {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   const isDark = nativeTheme.shouldUseDarkColors
 
@@ -417,7 +442,9 @@ function createSplashWindow(): BrowserWindow {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   splashWindow = new BrowserWindow({
     width: 760,
@@ -488,7 +515,9 @@ function createOnboardingWindow() {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   onboardingWindow = new BrowserWindow({
     width: 960,
@@ -534,7 +563,9 @@ function createVideoPlayerWindow(videoPath: string, videoWidth?: number, videoHe
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   // 获取屏幕尺寸
   const { screen } = require('electron')
@@ -632,7 +663,9 @@ function createImageViewerWindow(imagePath: string, liveVideoPath?: string) {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   const win = new BrowserWindow({
     width: 900,
@@ -646,16 +679,13 @@ function createImageViewerWindow(imagePath: string, liveVideoPath?: string) {
       nodeIntegration: false,
       webSecurity: false // 允许加载本地文件
     },
-    titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: '#00000000',
-      symbolColor: '#ffffff',
-      height: 40
-    },
+    frame: false,
     show: false,
     backgroundColor: '#000000',
     autoHideMenuBar: true
   })
+
+  setupCustomTitleBarWindow(win)
 
   win.once('ready-to-show', () => {
     win.show()
@@ -693,7 +723,9 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   // 根据系统主题设置窗口背景色
   const isDark = nativeTheme.shouldUseDarkColors
@@ -710,15 +742,12 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
       nodeIntegration: false
     },
     titleBarStyle: 'hidden',
-    titleBarOverlay: {
-      color: '#00000000',
-      symbolColor: isDark ? '#ffffff' : '#1a1a1a',
-      height: 32
-    },
+    titleBarOverlay: false,
     show: false,
     backgroundColor: isDark ? '#1A1A1A' : '#F0F0F0',
     autoHideMenuBar: true
   })
+  setupCustomTitleBarWindow(win)
 
   win.once('ready-to-show', () => {
     win.show()
@@ -771,7 +800,9 @@ function createSessionChatWindow(sessionId: string, options?: OpenSessionChatWin
   const isDev = !!process.env.VITE_DEV_SERVER_URL
   const iconPath = isDev
     ? join(__dirname, '../public/icon.ico')
-    : join(process.resourcesPath, 'icon.ico')
+    : (process.platform === 'darwin' 
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
 
   const isDark = nativeTheme.shouldUseDarkColors
 
@@ -964,6 +995,17 @@ function registerIpcHandlers() {
     }
   })
 
+  ipcMain.handle('log:clear', async () => {
+    try {
+      const logPath = join(app.getPath('userData'), 'logs', 'wcdb.log')
+      await mkdir(dirname(logPath), { recursive: true })
+      await writeFile(logPath, '', 'utf8')
+      return { success: true }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  })
+
   ipcMain.handle('diagnostics:getExportCardLogs', async (_, options?: { limit?: number }) => {
     return exportCardDiagnosticsService.snapshot(options?.limit)
   })
@@ -1101,6 +1143,11 @@ function registerIpcHandlers() {
     } else {
       win?.maximize()
     }
+  })
+
+  ipcMain.handle('window:isMaximized', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    return Boolean(win?.isMaximized() || win?.isFullScreen())
   })
 
   ipcMain.on('window:close', (event) => {
@@ -2002,7 +2049,6 @@ function registerIpcHandlers() {
           dbPath,
           decryptKey,
           wxid,
-          nativeTimeoutMs: 5000,
           onProgress: (progress) => {
             if (isYearsLoadCanceled(taskId)) return
             const snapshot = updateTaskSnapshot({
@@ -2400,6 +2446,55 @@ app.whenReady().then(async () => {
   updateSplashProgress(30, '正在加载界面...')
   mainWindow = createWindow({ autoShow: false })
 
+  // 初始化系统托盘图标（与其他窗口 icon 路径逻辑保持一致）
+  const resolvedTrayIcon = process.platform === 'win32'
+    ? join(__dirname, '../public/icon.ico')
+    : (process.platform === 'darwin'
+        ? join(process.resourcesPath, 'icon.icns')
+        : join(process.resourcesPath, 'icon.ico'))
+  try {
+    tray = new Tray(resolvedTrayIcon)
+    tray.setToolTip('WeFlow')
+    const contextMenu = Menu.buildFromTemplate([
+      {
+        label: '显示主窗口',
+        click: () => {
+          if (mainWindow) {
+            mainWindow.show()
+            mainWindow.focus()
+          }
+        }
+      },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          isAppQuitting = true
+          app.quit()
+        }
+      }
+    ])
+    tray.setContextMenu(contextMenu)
+    tray.on('click', () => {
+      if (mainWindow) {
+        if (mainWindow.isVisible()) {
+          mainWindow.focus()
+        } else {
+          mainWindow.show()
+          mainWindow.focus()
+        }
+      }
+    })
+    tray.on('double-click', () => {
+      if (mainWindow) {
+        mainWindow.show()
+        mainWindow.focus()
+      }
+    })
+  } catch (e) {
+    console.warn('[Tray] Failed to create tray icon:', e)
+  }
+
   // 配置网络服务
   session.defaultSession.webRequest.onBeforeSendHeaders(
     {
@@ -2447,12 +2542,20 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', async () => {
   isAppQuitting = true
+  // 销毁 tray 图标
+  if (tray) { try { tray.destroy() } catch {} tray = null }
   // 通知窗使用 hide 而非 close，退出时主动销毁，避免残留窗口阻塞进程退出。
   destroyNotificationWindow()
+  // 兜底：5秒后强制退出，防止某个异步任务卡住导致进程残留
+  const forceExitTimer = setTimeout(() => {
+    console.warn('[App] Force exit after timeout')
+    app.exit(0)
+  }, 5000)
+  forceExitTimer.unref()
   // 停止 HTTP 服务器，释放 TCP 端口占用，避免进程无法退出
   try { await httpService.stop() } catch {}
   // 终止 wcdb Worker 线程，避免线程阻止进程退出
-  try { wcdbService.shutdown() } catch {}
+  try { await wcdbService.shutdown() } catch {}
 })
 
 app.on('window-all-closed', () => {

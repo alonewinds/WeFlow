@@ -79,7 +79,8 @@
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
       "entitlements": "electron/entitlements.mac.plist",
-      "entitlementsInherit": "electron/entitlements.mac.plist"
+      "entitlementsInherit": "electron/entitlements.mac.plist",
+      "icon": "resources/icon.icns"
     },
     "win": {
       "target": [
@@ -129,6 +130,8 @@
     "asarUnpack": [
       "node_modules/silk-wasm/**/*",
       "node_modules/sherpa-onnx-node/**/*",
+      "node_modules/sherpa-onnx-*/*",
+      "node_modules/sherpa-onnx-*/**/*",
       "node_modules/ffmpeg-static/**/*"
     ],
     "extraFiles": [
@@ -148,6 +151,7 @@
         "from": "resources/vcruntime140_1.dll",
         "to": "."
       }
-    ]
+    ],
+    "icon": "resources/icon.icns"
   }
 }
