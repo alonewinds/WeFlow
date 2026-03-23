@@ -30,6 +30,16 @@ const tabs: { id: SettingsTab; label: string; icon: React.ElementType }[] = [
   { id: 'about', label: '关于', icon: Info }
 ]
 
+const isMac = navigator.userAgent.toLowerCase().includes('mac')
+const isLinux = navigator.userAgent.toLowerCase().includes('linux')
+
+const dbDirName = isMac ? '2.0b4.0.9 目录' : 'xwechat_files 目录'
+const dbPathPlaceholder = isMac
+    ? '例如: ~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9'
+    : isLinux
+        ? '例如: ~/.local/share/WeChat/xwechat_files 或者 ~/Documents/xwechat_files'
+        : '例如: C:\\Users\\xxx\\Documents\\xwechat_files'
+
 
 interface WxidOption {
   wxid: string
@@ -108,6 +118,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [notificationFilterMode, setNotificationFilterMode] = useState<'all' | 'whitelist' | 'blacklist'>('all')
   const [notificationFilterList, setNotificationFilterList] = useState<string[]>([])
   const [windowCloseBehavior, setWindowCloseBehavior] = useState<configService.WindowCloseBehavior>('ask')
+  const [quoteLayout, setQuoteLayout] = useState<configService.QuoteLayout>('quote-top')
   const [filterSearchKeyword, setFilterSearchKeyword] = useState('')
   const [filterModeDropdownOpen, setFilterModeDropdownOpen] = useState(false)
   const [positionDropdownOpen, setPositionDropdownOpen] = useState(false)
@@ -161,8 +172,24 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [httpApiMediaExportPath, setHttpApiMediaExportPath] = useState('')
   const [isTogglingApi, setIsTogglingApi] = useState(false)
   const [showApiWarning, setShowApiWarning] = useState(false)
+  const [messagePushEnabled, setMessagePushEnabled] = useState(false)
 
   const isClearingCache = isClearingAnalyticsCache || isClearingImageCache || isClearingAllCache
+
+  const [isWayland, setIsWayland] = useState(false)
+  useEffect(() => {
+    const checkWaylandStatus = async () => {
+      if (window.electronAPI?.app?.checkWayland) {
+        try {
+          const wayland = await window.electronAPI.app.checkWayland()
+          setIsWayland(wayland)
+        } catch (e) {
+          console.error('检查 Wayland 状态失败:', e)
+        }
+      }
+    }
+    checkWaylandStatus()
+  }, [])
 
   // 检查 Hello 可用性
   useEffect(() => {
@@ -286,7 +313,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const savedNotificationPosition = await configService.getNotificationPosition()
       const savedNotificationFilterMode = await configService.getNotificationFilterMode()
       const savedNotificationFilterList = await configService.getNotificationFilterList()
+      const savedMessagePushEnabled = await configService.getMessagePushEnabled()
       const savedWindowCloseBehavior = await configService.getWindowCloseBehavior()
+      const savedQuoteLayout = await configService.getQuoteLayout()
 
       const savedAuthEnabled = await window.electronAPI.auth.verifyEnabled()
       const savedAuthUseHello = await configService.getAuthUseHello()
@@ -322,7 +351,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       setNotificationPosition(savedNotificationPosition)
       setNotificationFilterMode(savedNotificationFilterMode)
       setNotificationFilterList(savedNotificationFilterList)
+      setMessagePushEnabled(savedMessagePushEnabled)
       setWindowCloseBehavior(savedWindowCloseBehavior)
+      setQuoteLayout(savedQuoteLayout)
 
       const savedExcludeWords = await configService.getWordCloudExcludeWords()
       setWordCloudExcludeWords(savedExcludeWords)
@@ -1030,6 +1061,77 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         ))}
       </div>
 
+      <div className="form-group">
+        <label>引用样式</label>
+        <span className="form-hint">选择聊天中引用消息与正文的上下顺序，右侧预览会同步展示布局差异。</span>
+        <div className="quote-layout-picker" role="radiogroup" aria-label="引用样式选择">
+          {[
+            {
+              value: 'quote-top' as const,
+              label: '引用在上',
+              description: '更接近当前 WeFlow 风格',
+              successMessage: '已切换为引用在上样式'
+            },
+            {
+              value: 'quote-bottom' as const,
+              label: '正文在上',
+              description: '更接近微信 / 密语风格',
+              successMessage: '已切换为正文在上样式'
+            }
+          ].map(option => {
+            const selected = quoteLayout === option.value
+            const quotePreview = (
+              <div className="quote-layout-preview-quote">
+                <span className="quote-layout-preview-sender">张三</span>
+                <span className="quote-layout-preview-text">这是一条被引用的消息</span>
+              </div>
+            )
+            const messagePreview = (
+              <div className="quote-layout-preview-message">这是当前发送的回复内容</div>
+            )
+
+            return (
+              <button
+                key={option.value}
+                type="button"
+                className={`quote-layout-card ${selected ? 'active' : ''}`}
+                onClick={async () => {
+                  if (selected) return
+                  setQuoteLayout(option.value)
+                  await configService.setQuoteLayout(option.value)
+                  showMessage(option.successMessage, true)
+                }}
+                role="radio"
+                aria-checked={selected}
+              >
+                <div className="quote-layout-card-header">
+                  <div className="quote-layout-card-title-group">
+                    <span className="quote-layout-card-title">{option.label}</span>
+                    <span className="quote-layout-card-desc">{option.description}</span>
+                  </div>
+                  <span className={`quote-layout-card-check ${selected ? 'active' : ''}`}>
+                    <Check size={14} />
+                  </span>
+                </div>
+                <div className={`quote-layout-preview ${option.value}`}>
+                  {option.value === 'quote-bottom' ? (
+                    <>
+                      {messagePreview}
+                      {quotePreview}
+                    </>
+                  ) : (
+                    <>
+                      {quotePreview}
+                      {messagePreview}
+                    </>
+                  )}
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
       <div className="divider" />
 
       <div className="form-group">
@@ -1156,6 +1258,11 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         <div className="form-group">
           <label>通知显示位置</label>
           <span className="form-hint">选择通知弹窗在屏幕上的显示位置</span>
+          {isWayland && (
+              <span className="form-hint" style={{ color: '#ff4d4f', marginTop: '4px', display: 'block' }}>
+              ⚠️ 注意：Wayland 环境下该配置可能无效！
+            </span>
+          )}
           <div className="custom-select">
             <div
               className={`custom-select-trigger ${positionDropdownOpen ? 'open' : ''}`}
@@ -1371,7 +1478,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         <span className="form-hint">xwechat_files 目录</span>
         <input
           type="text"
-          placeholder="例如: C:\Users\xxx\Documents\xwechat_files"
+          placeholder={dbPathPlaceholder}
           value={dbPath}
           onChange={(e) => {
             const value = e.target.value
@@ -1639,34 +1746,49 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   )
 
   const renderCacheTab = () => (
-    <div className="tab-content">
-      <p className="section-desc">管理应用缓存数据</p>
-      <div className="form-group">
-        <label>缓存目录 <span className="optional">(可选)</span></label>
-        <span className="form-hint">留空使用默认目录</span>
-        <input
-          type="text"
-          placeholder="留空使用默认目录"
-          value={cachePath}
-          onChange={(e) => {
-            const value = e.target.value
-            setCachePath(value)
-            scheduleConfigSave('cachePath', () => configService.setCachePath(value))
-          }}
-        />
-        <div className="btn-row">
-          <button className="btn btn-secondary" onClick={handleSelectCachePath}><FolderOpen size={16} /> 浏览选择</button>
-          <button
-            className="btn btn-secondary"
-            onClick={async () => {
-              setCachePath('')
-              await configService.setCachePath('')
-            }}
-          >
-            <RotateCcw size={16} /> 恢复默认
-          </button>
+      <div className="tab-content">
+        <p className="section-desc">管理应用缓存数据</p>
+        <div className="form-group">
+          <label>缓存目录 <span className="optional">(可选)</span></label>
+          <span className="form-hint">留空使用默认目录</span>
+          <input
+              type="text"
+              placeholder="留空使用默认目录"
+              value={cachePath}
+              onChange={(e) => {
+                const value = e.target.value
+                setCachePath(value)
+                scheduleConfigSave('cachePath', () => configService.setCachePath(value))
+              }}
+          />
+
+          <div style={{ marginTop: '8px', fontSize: '13px', color: 'var(--text-secondary)' }}>
+            当前缓存位置：
+            <code style={{
+              background: 'var(--bg-secondary)',
+              padding: '3px 6px',
+              borderRadius: '4px',
+              userSelect: 'all',
+              wordBreak: 'break-all',
+              marginLeft: '4px'
+            }}>
+              {cachePath || (isMac ? '~/Documents/WeFlow' : isLinux ? '~/Documents/WeFlow' : '系统 文档\\WeFlow 目录')}
+            </code>
+          </div>
+
+          <div className="btn-row" style={{ marginTop: '12px' }}>
+            <button className="btn btn-secondary" onClick={handleSelectCachePath}><FolderOpen size={16} /> 浏览选择</button>
+            <button
+                className="btn btn-secondary"
+                onClick={async () => {
+                  setCachePath('')
+                  await configService.setCachePath('')
+                }}
+            >
+              <RotateCcw size={16} /> 恢复默认
+            </button>
+          </div>
         </div>
-      </div>
 
       <div className="btn-row">
         <button className="btn btn-secondary" onClick={handleClearAnalyticsCache} disabled={isClearingCache}>
@@ -1736,6 +1858,12 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     showMessage('已复制 API 地址', true)
   }
 
+  const handleToggleMessagePush = async (enabled: boolean) => {
+    setMessagePushEnabled(enabled)
+    await configService.setMessagePushEnabled(enabled)
+    showMessage(enabled ? '已开启主动推送' : '已关闭主动推送', true)
+  }
+
   const renderApiTab = () => (
     <div className="tab-content">
       <div className="form-group">
@@ -1800,6 +1928,70 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
           value={httpApiMediaExportPath || '未获取到目录'}
           readOnly
         />
+      </div>
+
+      <div className="divider" />
+
+      <div className="form-group">
+        <label>主动推送</label>
+        <span className="form-hint">检测到新收到的消息后，会通过当前 API 端口下的固定 SSE 地址主动推送给外部订阅端</span>
+        <div className="log-toggle-line">
+          <span className="log-status">
+            {messagePushEnabled ? '已开启' : '已关闭'}
+          </span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={messagePushEnabled}
+              onChange={(e) => { void handleToggleMessagePush(e.target.checked) }}
+            />
+            <span className="switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      <div className="form-group">
+        <label>推送地址</label>
+        <span className="form-hint">外部软件连接这个 SSE 地址即可接收新消息推送；需要先开启上方 `HTTP API 服务`</span>
+        <div className="api-url-display">
+          <input
+            type="text"
+            className="field-input"
+            value={`http://127.0.0.1:${httpApiPort}/api/v1/push/messages`}
+            readOnly
+          />
+          <button
+            className="btn btn-secondary"
+            onClick={() => {
+              navigator.clipboard.writeText(`http://127.0.0.1:${httpApiPort}/api/v1/push/messages`)
+              showMessage('已复制推送地址', true)
+            }}
+            title="复制"
+          >
+            <Copy size={16} />
+          </button>
+        </div>
+      </div>
+
+      <div className="form-group">
+        <label>推送内容</label>
+        <span className="form-hint">SSE 事件名为 `message.new`；私聊推送 `avatarUrl/sourceName/content`，群聊额外附带 `groupName`</span>
+        <div className="api-docs">
+          <div className="api-item">
+            <div className="api-endpoint">
+              <span className="method get">GET</span>
+              <code>{`http://127.0.0.1:${httpApiPort}/api/v1/push/messages`}</code>
+            </div>
+            <p className="api-desc">通过 SSE 长连接接收消息事件，建议接收端按 `messageKey` 去重。</p>
+            <div className="api-params">
+              {['event', 'sessionId', 'messageKey', 'avatarUrl', 'sourceName', 'groupName?', 'content'].map((param) => (
+                <span key={param} className="param">
+                  <code>{param}</code>
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
 
       {showApiWarning && (

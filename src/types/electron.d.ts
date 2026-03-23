@@ -1,4 +1,4 @@
-import type { ChatSession, Message, Contact, ContactInfo } from './models'
+import type { ChatSession, Message, Contact, ContactInfo, ChatRecordItem } from './models'
 
 export interface SessionChatWindowOpenOptions {
   source?: 'chat' | 'export'
@@ -24,6 +24,8 @@ export interface ElectronAPI {
     resizeToFitVideo: (videoWidth: number, videoHeight: number) => Promise<void>
     openImageViewerWindow: (imagePath: string, liveVideoPath?: string) => Promise<void>
     openChatHistoryWindow: (sessionId: string, messageId: number) => Promise<boolean>
+    openChatHistoryPayloadWindow: (payload: { sessionId: string; title?: string; recordList: ChatRecordItem[] }) => Promise<boolean>
+    getChatHistoryPayload: (payloadId: string) => Promise<{ success: boolean; payload?: { sessionId: string; title?: string; recordList: ChatRecordItem[] }; error?: string }>
     openSessionChatWindow: (sessionId: string, options?: SessionChatWindowOpenOptions) => Promise<boolean>
   }
   config: {
@@ -59,6 +61,7 @@ export interface ElectronAPI {
     ignoreUpdate: (version: string) => Promise<{ success: boolean }>
     onDownloadProgress: (callback: (progress: number) => void) => () => void
     onUpdateAvailable: (callback: (info: { version: string; releaseNotes: string }) => void) => () => void
+    checkWayland: () => Promise<boolean>
   }
   notification: {
     show: (data: { title: string; content: string; avatarUrl?: string; sessionId: string }) => Promise<{ success?: boolean; error?: string } | void>
@@ -319,8 +322,7 @@ export interface ElectronAPI {
     getMessageDateCounts: (sessionId: string) => Promise<{ success: boolean; counts?: Record<string, number>; error?: string }>
     resolveVoiceCache: (sessionId: string, msgId: string) => Promise<{ success: boolean; hasCache: boolean; data?: string }>
     getVoiceTranscript: (sessionId: string, msgId: string, createTime?: number) => Promise<{ success: boolean; transcript?: string; error?: string }>
-    onVoiceTranscriptPartial: (callback: (payload: { msgId: string; text: string }) => void) => () => void
-    execQuery: (kind: string, path: string | null, sql: string) => Promise<{ success: boolean; rows?: any[]; error?: string }>
+    onVoiceTranscriptPartial: (callback: (payload: { sessionId?: string; msgId: string; createTime?: number; text: string }) => void) => () => void
     getMessage: (sessionId: string, localId: number) => Promise<{ success: boolean; message?: Message; error?: string }>
     onWcdbChange: (callback: (event: any, data: { type: string; json: string }) => void) => () => void
   }
@@ -789,6 +791,16 @@ export interface ElectronAPI {
         }>
         likes: Array<string>
         comments: Array<{ id: string; nickname: string; content: string; refCommentId: string; refNickname?: string; emojis?: Array<{ url: string; md5: string; width: number; height: number; encryptUrl?: string; aesKey?: string }> }>
+        location?: {
+          latitude?: number
+          longitude?: number
+          city?: string
+          country?: string
+          poiName?: string
+          poiAddress?: string
+          poiAddressName?: string
+          label?: string
+        }
         rawXml?: string
       }>
       error?: string
@@ -851,6 +863,7 @@ export interface ExportOptions {
   sessionNameWithTypePrefix?: boolean
   displayNamePreference?: 'group-nickname' | 'remark' | 'nickname'
   exportConcurrency?: number
+  imageDeepSearchOnMiss?: boolean
 }
 
 export interface ExportProgress {
@@ -862,6 +875,16 @@ export interface ExportProgress {
   phaseProgress?: number
   phaseTotal?: number
   phaseLabel?: string
+  collectedMessages?: number
+  exportedMessages?: number
+  estimatedTotalMessages?: number
+  writtenFiles?: number
+  mediaDoneFiles?: number
+  mediaCacheHitFiles?: number
+  mediaCacheMissFiles?: number
+  mediaCacheFillFiles?: number
+  mediaDedupReuseFiles?: number
+  mediaBytesWritten?: number
 }
 
 export interface WxidInfo {

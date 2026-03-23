@@ -34,6 +34,7 @@ export const CONFIG_KEYS = {
   EXPORT_DEFAULT_EXCEL_COMPACT_COLUMNS: 'exportDefaultExcelCompactColumns',
   EXPORT_DEFAULT_TXT_COLUMNS: 'exportDefaultTxtColumns',
   EXPORT_DEFAULT_CONCURRENCY: 'exportDefaultConcurrency',
+  EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS: 'exportDefaultImageDeepSearchOnMiss',
   EXPORT_WRITE_LAYOUT: 'exportWriteLayout',
   EXPORT_SESSION_NAME_PREFIX_ENABLED: 'exportSessionNamePrefixEnabled',
   EXPORT_LAST_SESSION_RUN_MAP: 'exportLastSessionRunMap',
@@ -63,7 +64,9 @@ export const CONFIG_KEYS = {
   NOTIFICATION_POSITION: 'notificationPosition',
   NOTIFICATION_FILTER_MODE: 'notificationFilterMode',
   NOTIFICATION_FILTER_LIST: 'notificationFilterList',
+  MESSAGE_PUSH_ENABLED: 'messagePushEnabled',
   WINDOW_CLOSE_BEHAVIOR: 'windowCloseBehavior',
+  QUOTE_LAYOUT: 'quoteLayout',
 
   // 词云
   WORD_CLOUD_EXCLUDE_WORDS: 'wordCloudExcludeWords',
@@ -88,6 +91,7 @@ export interface ExportDefaultMediaConfig {
 }
 
 export type WindowCloseBehavior = 'ask' | 'tray' | 'quit'
+export type QuoteLayout = 'quote-top' | 'quote-bottom'
 
 const DEFAULT_EXPORT_MEDIA_CONFIG: ExportDefaultMediaConfig = {
   images: true,
@@ -461,6 +465,18 @@ export async function setExportDefaultConcurrency(concurrency: number): Promise<
   await config.set(CONFIG_KEYS.EXPORT_DEFAULT_CONCURRENCY, concurrency)
 }
 
+// 获取缺图时是否深度搜索（默认导出行为）
+export async function getExportDefaultImageDeepSearchOnMiss(): Promise<boolean | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS)
+  if (typeof value === 'boolean') return value
+  return null
+}
+
+// 设置缺图时是否深度搜索（默认导出行为）
+export async function setExportDefaultImageDeepSearchOnMiss(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_IMAGE_DEEP_SEARCH_ON_MISS, enabled)
+}
+
 export type ExportWriteLayout = 'A' | 'B' | 'C'
 
 export async function getExportWriteLayout(): Promise<ExportWriteLayout> {
@@ -579,6 +595,8 @@ export interface ExportSessionContentMetricCacheEntry {
   imageMessages?: number
   videoMessages?: number
   emojiMessages?: number
+  firstTimestamp?: number
+  lastTimestamp?: number
 }
 
 export interface ExportSessionContentMetricCacheItem {
@@ -644,6 +662,7 @@ export interface ContactsListCacheContact {
   displayName: string
   remark?: string
   nickname?: string
+  alias?: string
   type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
 }
 
@@ -741,6 +760,12 @@ export async function getExportSessionContentMetricCache(scopeKey: string): Prom
     if (typeof source.emojiMessages === 'number' && Number.isFinite(source.emojiMessages) && source.emojiMessages >= 0) {
       metric.emojiMessages = Math.floor(source.emojiMessages)
     }
+    if (typeof source.firstTimestamp === 'number' && Number.isFinite(source.firstTimestamp) && source.firstTimestamp > 0) {
+      metric.firstTimestamp = Math.floor(source.firstTimestamp)
+    }
+    if (typeof source.lastTimestamp === 'number' && Number.isFinite(source.lastTimestamp) && source.lastTimestamp > 0) {
+      metric.lastTimestamp = Math.floor(source.lastTimestamp)
+    }
     if (Object.keys(metric).length === 0) continue
     metrics[sessionId] = metric
   }
@@ -779,6 +804,12 @@ export async function setExportSessionContentMetricCache(
     }
     if (typeof rawMetric.emojiMessages === 'number' && Number.isFinite(rawMetric.emojiMessages) && rawMetric.emojiMessages >= 0) {
       metric.emojiMessages = Math.floor(rawMetric.emojiMessages)
+    }
+    if (typeof rawMetric.firstTimestamp === 'number' && Number.isFinite(rawMetric.firstTimestamp) && rawMetric.firstTimestamp > 0) {
+      metric.firstTimestamp = Math.floor(rawMetric.firstTimestamp)
+    }
+    if (typeof rawMetric.lastTimestamp === 'number' && Number.isFinite(rawMetric.lastTimestamp) && rawMetric.lastTimestamp > 0) {
+      metric.lastTimestamp = Math.floor(rawMetric.lastTimestamp)
     }
     if (Object.keys(metric).length === 0) continue
     normalized[sessionId] = metric
@@ -1144,6 +1175,7 @@ export async function getContactsListCache(scopeKey: string): Promise<ContactsLi
       displayName,
       remark: typeof item.remark === 'string' ? item.remark : undefined,
       nickname: typeof item.nickname === 'string' ? item.nickname : undefined,
+      alias: typeof item.alias === 'string' ? item.alias : undefined,
       type: (type === 'friend' || type === 'group' || type === 'official' || type === 'former_friend' || type === 'other')
         ? type
         : 'other'
@@ -1177,6 +1209,7 @@ export async function setContactsListCache(scopeKey: string, contacts: ContactsL
       displayName,
       remark: contact?.remark ? String(contact.remark) : undefined,
       nickname: contact?.nickname ? String(contact.nickname) : undefined,
+      alias: contact?.alias ? String(contact.alias) : undefined,
       type
     })
   }
@@ -1362,6 +1395,15 @@ export async function setNotificationFilterList(list: string[]): Promise<void> {
   await config.set(CONFIG_KEYS.NOTIFICATION_FILTER_LIST, list)
 }
 
+export async function getMessagePushEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.MESSAGE_PUSH_ENABLED)
+  return value === true
+}
+
+export async function setMessagePushEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.MESSAGE_PUSH_ENABLED, enabled)
+}
+
 export async function getWindowCloseBehavior(): Promise<WindowCloseBehavior> {
   const value = await config.get(CONFIG_KEYS.WINDOW_CLOSE_BEHAVIOR)
   if (value === 'tray' || value === 'quit') return value
@@ -1370,6 +1412,16 @@ export async function getWindowCloseBehavior(): Promise<WindowCloseBehavior> {
 
 export async function setWindowCloseBehavior(behavior: WindowCloseBehavior): Promise<void> {
   await config.set(CONFIG_KEYS.WINDOW_CLOSE_BEHAVIOR, behavior)
+}
+
+export async function getQuoteLayout(): Promise<QuoteLayout> {
+  const value = await config.get(CONFIG_KEYS.QUOTE_LAYOUT)
+  if (value === 'quote-bottom') return value
+  return 'quote-top'
+}
+
+export async function setQuoteLayout(layout: QuoteLayout): Promise<void> {
+  await config.set(CONFIG_KEYS.QUOTE_LAYOUT, layout)
 }
 
 // 获取词云排除词列表

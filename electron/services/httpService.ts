@@ -103,6 +103,8 @@ class HttpService {
   private port: number = 5031
   private running: boolean = false
   private connections: Set<import('net').Socket> = new Set()
+  private messagePushClients: Set<http.ServerResponse> = new Set()
+  private messagePushHeartbeatTimer: ReturnType<typeof setInterval> | null = null
   private connectionMutex: boolean = false
 
   constructor() {
@@ -153,6 +155,7 @@ class HttpService {
 
       this.server.listen(this.port, '127.0.0.1', () => {
         this.running = true
+        this.startMessagePushHeartbeat()
         console.log(`[HttpService] HTTP API server started on http://127.0.0.1:${this.port}`)
         resolve({ success: true, port: this.port })
       })
@@ -165,6 +168,16 @@ class HttpService {
   async stop(): Promise<void> {
     return new Promise((resolve) => {
       if (this.server) {
+        for (const client of this.messagePushClients) {
+          try {
+            client.end()
+          } catch {}
+        }
+        this.messagePushClients.clear()
+        if (this.messagePushHeartbeatTimer) {
+          clearInterval(this.messagePushHeartbeatTimer)
+          this.messagePushHeartbeatTimer = null
+        }
         // 使用互斥锁保护连接集合操作
         this.connectionMutex = true
         const socketsToClose = Array.from(this.connections)
@@ -211,6 +224,28 @@ class HttpService {
     return this.getApiMediaExportPath()
   }
 
+  getMessagePushStreamUrl(): string {
+    return `http://127.0.0.1:${this.port}/api/v1/push/messages`
+  }
+
+  broadcastMessagePush(payload: Record<string, unknown>): void {
+    if (!this.running || this.messagePushClients.size === 0) return
+    const eventBody = `event: message.new\ndata: ${JSON.stringify(payload)}\n\n`
+
+    for (const client of Array.from(this.messagePushClients)) {
+      try {
+        if (client.writableEnded || client.destroyed) {
+          this.messagePushClients.delete(client)
+          continue
+        }
+        client.write(eventBody)
+      } catch {
+        this.messagePushClients.delete(client)
+        try { client.end() } catch {}
+      }
+    }
+  }
+
   /**
    * 处理 HTTP 请求
    */
@@ -233,6 +268,8 @@ class HttpService {
       // 路由处理
       if (pathname === '/health' || pathname === '/api/v1/health') {
         this.sendJson(res, { status: 'ok' })
+      } else if (pathname === '/api/v1/push/messages') {
+        this.handleMessagePushStream(req, res)
       } else if (pathname === '/api/v1/messages') {
         await this.handleMessages(url, res)
       } else if (pathname === '/api/v1/sessions') {
@@ -250,6 +287,50 @@ class HttpService {
       console.error('[HttpService] Request error:', error)
       this.sendError(res, 500, String(error))
     }
+  }
+
+  private startMessagePushHeartbeat(): void {
+    if (this.messagePushHeartbeatTimer) return
+    this.messagePushHeartbeatTimer = setInterval(() => {
+      for (const client of Array.from(this.messagePushClients)) {
+        try {
+          if (client.writableEnded || client.destroyed) {
+            this.messagePushClients.delete(client)
+            continue
+          }
+          client.write(': ping\n\n')
+        } catch {
+          this.messagePushClients.delete(client)
+          try { client.end() } catch {}
+        }
+      }
+    }, 25000)
+  }
+
+  private handleMessagePushStream(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (this.configService.get('messagePushEnabled') !== true) {
+      this.sendError(res, 403, 'Message push is disabled')
+      return
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    })
+    res.flushHeaders?.()
+    res.write(`event: ready\ndata: ${JSON.stringify({ success: true, stream: this.getMessagePushStreamUrl() })}\n\n`)
+
+    this.messagePushClients.add(res)
+
+    const cleanup = () => {
+      this.messagePushClients.delete(res)
+    }
+
+    req.on('close', cleanup)
+    res.on('close', cleanup)
+    res.on('error', cleanup)
   }
 
   private handleMediaRequest(pathname: string, res: http.ServerResponse): void {
@@ -1145,7 +1226,7 @@ class HttpService {
    * 映射 Type 49 子类型
    */
   private mapType49(msg: Message): number {
-    const xmlType = msg.xmlType
+    const xmlType = this.resolveType49Subtype(msg)
 
     switch (xmlType) {
       case '5': // 链接
@@ -1169,10 +1250,97 @@ class HttpService {
     }
   }
 
+  private extractType49Subtype(rawContent: string): string {
+    const content = String(rawContent || '')
+    if (!content) return ''
+
+    const appmsgMatch = /<appmsg[\s\S]*?>([\s\S]*?)<\/appmsg>/i.exec(content)
+    if (appmsgMatch) {
+      const appmsgInner = appmsgMatch[1]
+        .replace(/<refermsg[\s\S]*?<\/refermsg>/gi, '')
+        .replace(/<patMsg[\s\S]*?<\/patMsg>/gi, '')
+      const typeMatch = /<type>([\s\S]*?)<\/type>/i.exec(appmsgInner)
+      if (typeMatch) {
+        return typeMatch[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim()
+      }
+    }
+
+    const fallbackMatch = /<type>([\s\S]*?)<\/type>/i.exec(content)
+    if (fallbackMatch) {
+      return fallbackMatch[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim()
+    }
+
+    return ''
+  }
+
+  private resolveType49Subtype(msg: Message): string {
+    const xmlType = String(msg.xmlType || '').trim()
+    if (xmlType) return xmlType
+
+    const extractedType = this.extractType49Subtype(msg.rawContent)
+    if (extractedType) return extractedType
+
+    switch (msg.appMsgKind) {
+      case 'official-link':
+      case 'link':
+        return '5'
+      case 'file':
+        return '6'
+      case 'chat-record':
+        return '19'
+      case 'miniapp':
+        return '33'
+      case 'quote':
+        return '57'
+      case 'transfer':
+        return '2000'
+      case 'red-packet':
+        return '2001'
+      case 'music':
+        return '3'
+      default:
+        if (msg.linkUrl) return '5'
+        if (msg.fileName) return '6'
+        return ''
+    }
+  }
+
+  private getType49Content(msg: Message): string {
+    const subtype = this.resolveType49Subtype(msg)
+    const title = msg.linkTitle || msg.fileName || ''
+
+    switch (subtype) {
+      case '5':
+      case '49':
+        return title ? `[链接] ${title}` : '[链接]'
+      case '6':
+        return title ? `[文件] ${title}` : '[文件]'
+      case '19':
+        return title ? `[聊天记录] ${title}` : '[聊天记录]'
+      case '33':
+      case '36':
+        return title ? `[小程序] ${title}` : '[小程序]'
+      case '57':
+        return msg.parsedContent || title || '[引用消息]'
+      case '2000':
+        return title ? `[转账] ${title}` : '[转账]'
+      case '2001':
+        return title ? `[红包] ${title}` : '[红包]'
+      case '3':
+        return title ? `[音乐] ${title}` : '[音乐]'
+      default:
+        return msg.parsedContent || title || '[消息]'
+    }
+  }
+
   /**
    * 获取消息内容
    */
   private getMessageContent(msg: Message): string | null {
+    if (msg.localType === 49) {
+      return this.getType49Content(msg)
+    }
+
     // 优先使用已解析的内容
     if (msg.parsedContent) {
       return msg.parsedContent
@@ -1195,7 +1363,7 @@ class HttpService {
       case 48:
         return '[位置]'
       case 49:
-        return msg.linkTitle || msg.fileName || '[消息]'
+        return this.getType49Content(msg)
       default:
         return msg.rawContent || null
     }

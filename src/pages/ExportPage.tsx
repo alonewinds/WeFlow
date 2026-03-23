@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type UIEvent, type WheelEvent } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { createPortal } from 'react-dom'
 import {
@@ -44,17 +44,22 @@ import {
   subscribeBackgroundTasks
 } from '../services/backgroundTaskMonitor'
 import { useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
+import { useChatStore } from '../stores/chatStore'
 import { SnsPostItem } from '../components/Sns/SnsPostItem'
 import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
 import { ExportDateRangeDialog } from '../components/Export/ExportDateRangeDialog'
 import { ExportDefaultsSettingsForm, type ExportDefaultsSettingsPatch } from '../components/Export/ExportDefaultsSettingsForm'
+import { Avatar } from '../components/Avatar'
 import type { SnsPost } from '../types/sns'
 import {
   cloneExportDateRange,
+  cloneExportDateRangeSelection,
   createDefaultDateRange,
   createDefaultExportDateRangeSelection,
   getExportDateRangeLabel,
   resolveExportDateRangeConfig,
+  startOfDay,
+  endOfDay,
   type ExportDateRangeSelection
 } from '../utils/exportDateRange'
 import './ExportPage.scss'
@@ -88,6 +93,7 @@ interface ExportOptions {
   txtColumns: string[]
   displayNamePreference: DisplayNamePreference
   exportConcurrency: number
+  imageDeepSearchOnMiss: boolean
 }
 
 interface SessionRow extends AppChatSession {
@@ -104,6 +110,16 @@ interface TaskProgress {
   phaseLabel: string
   phaseProgress: number
   phaseTotal: number
+  exportedMessages: number
+  estimatedTotalMessages: number
+  collectedMessages: number
+  writtenFiles: number
+  mediaDoneFiles: number
+  mediaCacheHitFiles: number
+  mediaCacheMissFiles: number
+  mediaCacheFillFiles: number
+  mediaDedupReuseFiles: number
+  mediaBytesWritten: number
 }
 
 type TaskPerfStage = 'collect' | 'build' | 'write' | 'other'
@@ -166,7 +182,7 @@ interface ExportDialogState {
 const defaultTxtColumns = ['index', 'time', 'senderRole', 'messageType', 'content']
 const DETAIL_PRECISE_REFRESH_COOLDOWN_MS = 10 * 60 * 1000
 const SESSION_MEDIA_METRIC_PREFETCH_ROWS = 10
-const SESSION_MEDIA_METRIC_BATCH_SIZE = 12
+const SESSION_MEDIA_METRIC_BATCH_SIZE = 8
 const SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE = 48
 const SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS = 120
 const SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS = 1200
@@ -254,7 +270,17 @@ const createEmptyProgress = (): TaskProgress => ({
   phase: '',
   phaseLabel: '',
   phaseProgress: 0,
-  phaseTotal: 0
+  phaseTotal: 0,
+  exportedMessages: 0,
+  estimatedTotalMessages: 0,
+  collectedMessages: 0,
+  writtenFiles: 0,
+  mediaDoneFiles: 0,
+  mediaCacheHitFiles: 0,
+  mediaCacheMissFiles: 0,
+  mediaCacheFillFiles: 0,
+  mediaDedupReuseFiles: 0,
+  mediaBytesWritten: 0
 })
 
 const createEmptyTaskPerformance = (): TaskPerformance => ({
@@ -511,6 +537,14 @@ const exportKindPriority: Record<ConversationTab, number> = {
 const getAvatarLetter = (name: string): string => {
   if (!name) return '?'
   return [...name][0] || '?'
+}
+
+const normalizeExportAvatarUrl = (value?: string | null): string | undefined => {
+  const normalized = String(value || '').trim()
+  if (!normalized) return undefined
+  const lower = normalized.toLowerCase()
+  if (lower === 'null' || lower === 'undefined') return undefined
+  return normalized
 }
 
 const toComparableNameSet = (values: Array<string | undefined | null>): Set<string> => {
@@ -809,6 +843,13 @@ interface SessionContentMetric {
   transferMessages?: number
   redPacketMessages?: number
   callMessages?: number
+  firstTimestamp?: number
+  lastTimestamp?: number
+}
+
+interface TimeRangeBounds {
+  minDate: Date
+  maxDate: Date
 }
 
 interface SessionExportCacheMeta {
@@ -995,7 +1036,7 @@ const toSessionRowsWithContacts = (
           kind: toKindByContact(contact),
           wechatId: contact.username,
           displayName: contact.displayName || session?.displayName || contact.username,
-          avatarUrl: contact.avatarUrl || session?.avatarUrl,
+          avatarUrl: session?.avatarUrl || contact.avatarUrl,
           hasSession: Boolean(session)
         } as SessionRow
       })
@@ -1015,7 +1056,7 @@ const toSessionRowsWithContacts = (
         kind: toKindByContactType(session, contact),
         wechatId: contact?.username || session.username,
         displayName: contact?.displayName || session.displayName || session.username,
-        avatarUrl: contact?.avatarUrl || session.avatarUrl,
+        avatarUrl: session.avatarUrl || contact?.avatarUrl,
         hasSession: true
       } as SessionRow
     })
@@ -1028,27 +1069,74 @@ const normalizeMessageCount = (value: unknown): number | undefined => {
   return Math.floor(parsed)
 }
 
+const normalizeTimestampSeconds = (value: unknown): number | undefined => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return Math.floor(parsed)
+}
+
+const clampExportSelectionToBounds = (
+  selection: ExportDateRangeSelection,
+  bounds: TimeRangeBounds | null
+): ExportDateRangeSelection => {
+  if (!bounds) return cloneExportDateRangeSelection(selection)
+
+  const boundedStart = startOfDay(bounds.minDate)
+  const boundedEnd = endOfDay(bounds.maxDate)
+  const originalStart = selection.useAllTime ? boundedStart : startOfDay(selection.dateRange.start)
+  const originalEnd = selection.useAllTime ? boundedEnd : endOfDay(selection.dateRange.end)
+  const nextStart = new Date(Math.min(Math.max(originalStart.getTime(), boundedStart.getTime()), boundedEnd.getTime()))
+  const nextEndCandidate = new Date(Math.min(Math.max(originalEnd.getTime(), boundedStart.getTime()), boundedEnd.getTime()))
+  const nextEnd = nextEndCandidate.getTime() < nextStart.getTime() ? endOfDay(nextStart) : nextEndCandidate
+  const rangeChanged = nextStart.getTime() !== originalStart.getTime() || nextEnd.getTime() !== originalEnd.getTime()
+
+  return {
+    preset: selection.useAllTime ? selection.preset : (rangeChanged ? 'custom' : selection.preset),
+    useAllTime: selection.useAllTime,
+    dateRange: {
+      start: nextStart,
+      end: nextEnd
+    }
+  }
+}
+
+const areExportSelectionsEqual = (left: ExportDateRangeSelection, right: ExportDateRangeSelection): boolean => (
+  left.preset === right.preset &&
+  left.useAllTime === right.useAllTime &&
+  left.dateRange.start.getTime() === right.dateRange.start.getTime() &&
+  left.dateRange.end.getTime() === right.dateRange.end.getTime()
+)
+
 const pickSessionMediaMetric = (
   metricRaw: SessionExportMetric | SessionContentMetric | undefined
 ): SessionContentMetric | null => {
   if (!metricRaw) return null
+  const totalMessages = normalizeMessageCount(metricRaw.totalMessages)
   const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
   const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
   const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
   const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
+  const firstTimestamp = normalizeTimestampSeconds(metricRaw.firstTimestamp)
+  const lastTimestamp = normalizeTimestampSeconds(metricRaw.lastTimestamp)
   if (
+    typeof totalMessages !== 'number' &&
     typeof voiceMessages !== 'number' &&
     typeof imageMessages !== 'number' &&
     typeof videoMessages !== 'number' &&
-    typeof emojiMessages !== 'number'
+    typeof emojiMessages !== 'number' &&
+    typeof firstTimestamp !== 'number' &&
+    typeof lastTimestamp !== 'number'
   ) {
     return null
   }
   return {
+    totalMessages,
     voiceMessages,
     imageMessages,
     videoMessages,
-    emojiMessages
+    emojiMessages,
+    firstTimestamp,
+    lastTimestamp
   }
 }
 
@@ -1280,6 +1368,45 @@ const TaskCenterModal = memo(function TaskCenterModal({
                   completedSessionTotal,
                   (task.settledSessionIds || []).length
                 )
+                const exportedMessages = Math.max(0, Math.floor(task.progress.exportedMessages || 0))
+                const estimatedTotalMessages = Math.max(0, Math.floor(task.progress.estimatedTotalMessages || 0))
+                const collectedMessages = Math.max(0, Math.floor(task.progress.collectedMessages || 0))
+                const messageProgressLabel = estimatedTotalMessages > 0
+                  ? `已导出 ${Math.min(exportedMessages, estimatedTotalMessages)}/${estimatedTotalMessages} 条`
+                  : `已导出 ${exportedMessages} 条`
+                const effectiveMessageProgressLabel = (
+                  exportedMessages > 0 || estimatedTotalMessages > 0 || collectedMessages <= 0 || task.progress.phase !== 'preparing'
+                )
+                  ? messageProgressLabel
+                  : `已收集 ${collectedMessages.toLocaleString()} 条`
+                const phaseProgress = Math.max(0, Math.floor(task.progress.phaseProgress || 0))
+                const phaseTotal = Math.max(0, Math.floor(task.progress.phaseTotal || 0))
+                const mediaDoneFiles = Math.max(0, Math.floor(task.progress.mediaDoneFiles || 0))
+                const mediaCacheHitFiles = Math.max(0, Math.floor(task.progress.mediaCacheHitFiles || 0))
+                const mediaCacheMissFiles = Math.max(0, Math.floor(task.progress.mediaCacheMissFiles || 0))
+                const mediaDedupReuseFiles = Math.max(0, Math.floor(task.progress.mediaDedupReuseFiles || 0))
+                const mediaCacheTotal = mediaCacheHitFiles + mediaCacheMissFiles
+                const mediaCacheMetricLabel = mediaCacheTotal > 0
+                  ? `缓存命中 ${mediaCacheHitFiles}/${mediaCacheTotal}`
+                  : ''
+                const mediaDedupMetricLabel = mediaDedupReuseFiles > 0
+                  ? `复用 ${mediaDedupReuseFiles}`
+                  : ''
+                const phaseMetricLabel = phaseTotal > 0
+                  ? (
+                    task.progress.phase === 'exporting-media'
+                      ? `媒体 ${Math.min(phaseProgress, phaseTotal)}/${phaseTotal}`
+                      : task.progress.phase === 'exporting-voice'
+                        ? `语音 ${Math.min(phaseProgress, phaseTotal)}/${phaseTotal}`
+                        : ''
+                  )
+                  : ''
+                const mediaLiveMetricLabel = task.progress.phase === 'exporting-media'
+                  ? (mediaDoneFiles > 0 ? `已处理 ${mediaDoneFiles}` : '')
+                  : ''
+                const sessionProgressLabel = completedSessionTotal > 0
+                  ? `会话 ${completedSessionCount}/${completedSessionTotal}`
+                  : '会话处理中'
                 const currentSessionRatio = task.progress.phaseTotal > 0
                   ? Math.max(0, Math.min(1, task.progress.phaseProgress / task.progress.phaseTotal))
                   : null
@@ -1300,9 +1427,11 @@ const TaskCenterModal = memo(function TaskCenterModal({
                             />
                           </div>
                           <div className="task-progress-text">
-                            {completedSessionTotal > 0
-                              ? `已完成 ${completedSessionCount} / ${completedSessionTotal}`
-                              : '处理中'}
+                            {`${sessionProgressLabel} · ${effectiveMessageProgressLabel}`}
+                            {phaseMetricLabel ? ` · ${phaseMetricLabel}` : ''}
+                            {mediaLiveMetricLabel ? ` · ${mediaLiveMetricLabel}` : ''}
+                            {mediaCacheMetricLabel ? ` · ${mediaCacheMetricLabel}` : ''}
+                            {mediaDedupMetricLabel ? ` · ${mediaDedupMetricLabel}` : ''}
                             {task.status === 'running' && currentSessionRatio !== null
                               ? `（当前会话 ${Math.round(currentSessionRatio * 100)}%）`
                               : ''}
@@ -1387,6 +1516,8 @@ const TaskCenterModal = memo(function TaskCenterModal({
 })
 
 function ExportPage() {
+  const navigate = useNavigate()
+  const { setCurrentSession } = useChatStore()
   const location = useLocation()
   const isExportRoute = location.pathname === '/export'
 
@@ -1456,6 +1587,8 @@ function ExportPage() {
   const [snsExportLivePhotos, setSnsExportLivePhotos] = useState(false)
   const [snsExportVideos, setSnsExportVideos] = useState(false)
   const [isTimeRangeDialogOpen, setIsTimeRangeDialogOpen] = useState(false)
+  const [isResolvingTimeRangeBounds, setIsResolvingTimeRangeBounds] = useState(false)
+  const [timeRangeBounds, setTimeRangeBounds] = useState<TimeRangeBounds | null>(null)
   const [isExportDefaultsModalOpen, setIsExportDefaultsModalOpen] = useState(false)
   const [timeRangeSelection, setTimeRangeSelection] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
   const [exportDefaultFormat, setExportDefaultFormat] = useState<TextExportFormat>('excel')
@@ -1470,6 +1603,7 @@ function ExportPage() {
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
   const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
   const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(2)
+  const [exportDefaultImageDeepSearchOnMiss, setExportDefaultImageDeepSearchOnMiss] = useState(true)
 
   const [options, setOptions] = useState<ExportOptions>({
     format: 'json',
@@ -1488,7 +1622,8 @@ function ExportPage() {
     excelCompactColumns: true,
     txtColumns: defaultTxtColumns,
     displayNamePreference: 'remark',
-    exportConcurrency: 2
+    exportConcurrency: 2,
+    imageDeepSearchOnMiss: true
   })
 
   const [exportDialog, setExportDialog] = useState<ExportDialogState>({
@@ -1587,6 +1722,7 @@ function ExportPage() {
     startIndex: 0,
     endIndex: -1
   })
+  const avatarHydrationRequestedRef = useRef<Set<string>>(new Set())
   const sessionMutualFriendsMetricsRef = useRef<Record<string, SessionMutualFriendsMetric>>({})
   const sessionMutualFriendsDirectMetricsRef = useRef<Record<string, SessionMutualFriendsMetric>>({})
   const sessionMutualFriendsQueueRef = useRef<string[]>([])
@@ -1831,6 +1967,7 @@ function ExportPage() {
             displayName: contact.displayName,
             remark: contact.remark,
             nickname: contact.nickname,
+            alias: contact.alias,
             type: contact.type
           }))
         ).catch((error) => {
@@ -1871,6 +2008,94 @@ function ExportPage() {
       }
     }
   }, [ensureExportCacheScope, syncContactTypeCounts])
+
+  const hydrateVisibleContactAvatars = useCallback(async (usernames: string[]) => {
+    const targets = Array.from(new Set(
+      (usernames || [])
+        .map((username) => String(username || '').trim())
+        .filter(Boolean)
+    )).filter((username) => {
+      if (avatarHydrationRequestedRef.current.has(username)) return false
+      const contact = contactsList.find((item) => item.username === username)
+      const session = sessions.find((item) => item.username === username)
+      const existingAvatarUrl = normalizeExportAvatarUrl(contact?.avatarUrl || session?.avatarUrl)
+      return !existingAvatarUrl
+    })
+
+    if (targets.length === 0) return
+    targets.forEach((username) => avatarHydrationRequestedRef.current.add(username))
+
+    const settled = await Promise.allSettled(
+      targets.map(async (username) => {
+        const profile = await window.electronAPI.chat.getContactAvatar(username)
+        return {
+          username,
+          avatarUrl: normalizeExportAvatarUrl(profile?.avatarUrl),
+          displayName: profile?.displayName ? String(profile.displayName).trim() : undefined
+        }
+      })
+    )
+
+    const avatarPatches = new Map<string, { avatarUrl?: string; displayName?: string }>()
+    for (const item of settled) {
+      if (item.status !== 'fulfilled') continue
+      const { username, avatarUrl, displayName } = item.value
+      if (!avatarUrl && !displayName) continue
+      avatarPatches.set(username, { avatarUrl, displayName })
+    }
+    if (avatarPatches.size === 0) return
+
+    const now = Date.now()
+    setContactsList((prev) => prev.map((contact) => {
+      const patch = avatarPatches.get(contact.username)
+      if (!patch) return contact
+      return {
+        ...contact,
+        displayName: patch.displayName || contact.displayName,
+        avatarUrl: patch.avatarUrl || contact.avatarUrl
+      }
+    }))
+    setSessions((prev) => prev.map((session) => {
+      const patch = avatarPatches.get(session.username)
+      if (!patch) return session
+      return {
+        ...session,
+        displayName: patch.displayName || session.displayName,
+        avatarUrl: patch.avatarUrl || session.avatarUrl
+      }
+    }))
+    setSessionDetail((prev) => {
+      if (!prev) return prev
+      const patch = avatarPatches.get(prev.wxid)
+      if (!patch) return prev
+      return {
+        ...prev,
+        displayName: patch.displayName || prev.displayName,
+        avatarUrl: patch.avatarUrl || prev.avatarUrl
+      }
+    })
+
+    let avatarCacheChanged = false
+    for (const [username, patch] of avatarPatches.entries()) {
+      if (!patch.avatarUrl) continue
+      const previous = contactsAvatarCacheRef.current[username]
+      if (previous?.avatarUrl === patch.avatarUrl) continue
+      contactsAvatarCacheRef.current[username] = {
+        avatarUrl: patch.avatarUrl,
+        updatedAt: now,
+        checkedAt: now
+      }
+      avatarCacheChanged = true
+    }
+    if (avatarCacheChanged) {
+      setAvatarCacheUpdatedAt(now)
+      const scopeKey = exportCacheScopeRef.current
+      if (scopeKey) {
+        void configService.setContactsAvatarCache(scopeKey, contactsAvatarCacheRef.current).catch(() => {})
+      }
+    }
+  }, [contactsList, sessions])
+
 
   useEffect(() => {
     if (!isExportRoute) return
@@ -2015,7 +2240,7 @@ function ExportPage() {
     setIsBaseConfigLoading(true)
     let isReady = true
     try {
-      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, exportCacheScope] = await Promise.all([
+      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedImageDeepSearchOnMiss, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, exportCacheScope] = await Promise.all([
         configService.getExportPath(),
         configService.getExportDefaultFormat(),
         configService.getExportDefaultAvatars(),
@@ -2024,6 +2249,7 @@ function ExportPage() {
         configService.getExportDefaultExcelCompactColumns(),
         configService.getExportDefaultTxtColumns(),
         configService.getExportDefaultConcurrency(),
+        configService.getExportDefaultImageDeepSearchOnMiss(),
         configService.getExportLastSessionRunMap(),
         configService.getExportLastContentRunMap(),
         configService.getExportSessionRecordMap(),
@@ -2060,6 +2286,7 @@ function ExportPage() {
       setExportDefaultVoiceAsText(savedVoiceAsText ?? false)
       setExportDefaultExcelCompactColumns(savedExcelCompactColumns ?? true)
       setExportDefaultConcurrency(savedConcurrency ?? 2)
+      setExportDefaultImageDeepSearchOnMiss(savedImageDeepSearchOnMiss ?? true)
       const resolvedDefaultDateRange = resolveExportDateRangeConfig(savedDefaultDateRange)
       setExportDefaultDateRangeSelection(resolvedDefaultDateRange)
       setTimeRangeSelection(resolvedDefaultDateRange)
@@ -2092,7 +2319,8 @@ function ExportPage() {
         exportVoiceAsText: savedVoiceAsText ?? prev.exportVoiceAsText,
         excelCompactColumns: savedExcelCompactColumns ?? prev.excelCompactColumns,
         txtColumns,
-        exportConcurrency: savedConcurrency ?? prev.exportConcurrency
+        exportConcurrency: savedConcurrency ?? prev.exportConcurrency,
+        imageDeepSearchOnMiss: savedImageDeepSearchOnMiss ?? prev.imageDeepSearchOnMiss
       }))
     } catch (error) {
       isReady = false
@@ -2622,7 +2850,9 @@ function ExportPage() {
         typeof emojiMessages !== 'number' &&
         typeof transferMessages !== 'number' &&
         typeof redPacketMessages !== 'number' &&
-        typeof callMessages !== 'number'
+        typeof callMessages !== 'number' &&
+        typeof normalizeTimestampSeconds(metricRaw.firstTimestamp) !== 'number' &&
+        typeof normalizeTimestampSeconds(metricRaw.lastTimestamp) !== 'number'
       ) {
         continue
       }
@@ -2635,7 +2865,9 @@ function ExportPage() {
         emojiMessages,
         transferMessages,
         redPacketMessages,
-        callMessages
+        callMessages,
+        firstTimestamp: normalizeTimestampSeconds(metricRaw.firstTimestamp),
+        lastTimestamp: normalizeTimestampSeconds(metricRaw.lastTimestamp)
       }
       if (typeof totalMessages === 'number') {
         nextMessageCounts[sessionId] = totalMessages
@@ -2669,7 +2901,9 @@ function ExportPage() {
             emojiMessages: typeof metric.emojiMessages === 'number' ? metric.emojiMessages : previous.emojiMessages,
             transferMessages: typeof metric.transferMessages === 'number' ? metric.transferMessages : previous.transferMessages,
             redPacketMessages: typeof metric.redPacketMessages === 'number' ? metric.redPacketMessages : previous.redPacketMessages,
-            callMessages: typeof metric.callMessages === 'number' ? metric.callMessages : previous.callMessages
+            callMessages: typeof metric.callMessages === 'number' ? metric.callMessages : previous.callMessages,
+            firstTimestamp: typeof metric.firstTimestamp === 'number' ? metric.firstTimestamp : previous.firstTimestamp,
+            lastTimestamp: typeof metric.lastTimestamp === 'number' ? metric.lastTimestamp : previous.lastTimestamp
           }
           if (
             previous.totalMessages === nextMetric.totalMessages &&
@@ -2679,7 +2913,9 @@ function ExportPage() {
             previous.emojiMessages === nextMetric.emojiMessages &&
             previous.transferMessages === nextMetric.transferMessages &&
             previous.redPacketMessages === nextMetric.redPacketMessages &&
-            previous.callMessages === nextMetric.callMessages
+            previous.callMessages === nextMetric.callMessages &&
+            previous.firstTimestamp === nextMetric.firstTimestamp &&
+            previous.lastTimestamp === nextMetric.lastTimestamp
           ) {
             continue
           }
@@ -2787,6 +3023,7 @@ function ExportPage() {
   }, [])
 
   const enqueueSessionMutualFriendsRequests = useCallback((sessionIds: string[], options?: { front?: boolean }) => {
+    if (activeTaskCountRef.current > 0) return
     const front = options?.front === true
     const incoming: string[] = []
     for (const sessionIdRaw of sessionIds) {
@@ -2976,6 +3213,7 @@ function ExportPage() {
   }, [])
 
   const enqueueSessionMediaMetricRequests = useCallback((sessionIds: string[], options?: { front?: boolean }) => {
+    if (activeTaskCountRef.current > 0) return
     const front = options?.front === true
     const incoming: string[] = []
     for (const sessionIdRaw of sessionIds) {
@@ -3025,13 +3263,27 @@ function ExportPage() {
   const runSessionMediaMetricWorker = useCallback(async (runId: number) => {
     if (sessionMediaMetricWorkerRunningRef.current) return
     sessionMediaMetricWorkerRunningRef.current = true
+    const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, stage: string): Promise<T> => {
+      let timer: number | null = null
+      try {
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timer = window.setTimeout(() => {
+            reject(new Error(`会话多媒体统计超时(${stage}, ${timeoutMs}ms)`))
+          }, timeoutMs)
+        })
+        return await Promise.race([promise, timeoutPromise])
+      } finally {
+        if (timer !== null) {
+          window.clearTimeout(timer)
+        }
+      }
+    }
     try {
       while (runId === sessionMediaMetricRunIdRef.current) {
-        if (isLoadingSessionCountsRef.current || detailStatsPriorityRef.current) {
-          await new Promise(resolve => window.setTimeout(resolve, 80))
+        if (activeTaskCountRef.current > 0) {
+          await new Promise(resolve => window.setTimeout(resolve, 150))
           continue
         }
-
         if (sessionMediaMetricQueueRef.current.length === 0) break
 
         const batchSessionIds: string[] = []
@@ -3050,9 +3302,13 @@ function ExportPage() {
         patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'loading')
 
         try {
-          const cacheResult = await window.electronAPI.chat.getExportSessionStats(
-            batchSessionIds,
-            { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+          const cacheResult = await withTimeout(
+            window.electronAPI.chat.getExportSessionStats(
+              batchSessionIds,
+              { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+            ),
+            12000,
+            'cacheOnly'
           )
           if (runId !== sessionMediaMetricRunIdRef.current) return
           if (cacheResult.success && cacheResult.data) {
@@ -3061,14 +3317,25 @@ function ExportPage() {
 
           const missingSessionIds = batchSessionIds.filter(sessionId => !isSessionMediaMetricReady(sessionId))
           if (missingSessionIds.length > 0) {
-            const freshResult = await window.electronAPI.chat.getExportSessionStats(
-              missingSessionIds,
-              { includeRelations: false, allowStaleCache: true }
+            const freshResult = await withTimeout(
+              window.electronAPI.chat.getExportSessionStats(
+                missingSessionIds,
+                { includeRelations: false, allowStaleCache: true }
+              ),
+              45000,
+              'fresh'
             )
             if (runId !== sessionMediaMetricRunIdRef.current) return
             if (freshResult.success && freshResult.data) {
               applySessionMediaMetricsFromStats(freshResult.data as Record<string, SessionExportMetric>)
             }
+          }
+
+          const unresolvedSessionIds = batchSessionIds.filter(sessionId => !isSessionMediaMetricReady(sessionId))
+          if (unresolvedSessionIds.length > 0) {
+            patchSessionLoadTraceStage(unresolvedSessionIds, 'mediaMetrics', 'failed', {
+              error: '统计结果缺失，已跳过当前批次'
+            })
           }
         } catch (error) {
           console.error('导出页加载会话媒体统计失败:', error)
@@ -3100,12 +3367,11 @@ function ExportPage() {
   }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage])
 
   const scheduleSessionMediaMetricWorker = useCallback(() => {
-    if (!isSessionCountStageReady) return
-    if (isLoadingSessionCountsRef.current) return
+    if (activeTaskCountRef.current > 0) return
     if (sessionMediaMetricWorkerRunningRef.current) return
     const runId = sessionMediaMetricRunIdRef.current
     void runSessionMediaMetricWorker(runId)
-  }, [isSessionCountStageReady, runSessionMediaMetricWorker])
+  }, [runSessionMediaMetricWorker])
 
   const loadSessionMutualFriendsMetric = useCallback(async (sessionId: string): Promise<SessionMutualFriendsMetric> => {
     const normalizedSessionId = String(sessionId || '').trim()
@@ -3150,6 +3416,10 @@ function ExportPage() {
     sessionMutualFriendsWorkerRunningRef.current = true
     try {
       while (runId === sessionMutualFriendsRunIdRef.current) {
+        if (activeTaskCountRef.current > 0) {
+          await new Promise(resolve => window.setTimeout(resolve, 150))
+          continue
+        }
         if (hasPendingMetricLoads()) {
           await new Promise(resolve => window.setTimeout(resolve, 120))
           continue
@@ -3196,6 +3466,7 @@ function ExportPage() {
   ])
 
   const scheduleSessionMutualFriendsWorker = useCallback(() => {
+    if (activeTaskCountRef.current > 0) return
     if (!isSessionCountStageReady) return
     if (hasPendingMetricLoads()) return
     if (sessionMutualFriendsWorkerRunningRef.current) return
@@ -3291,9 +3562,6 @@ function ExportPage() {
 
     setIsLoadingSessionCounts(true)
     try {
-      if (detailStatsPriorityRef.current) {
-        return { ...accumulatedCounts }
-      }
       if (prioritizedSessionIds.length > 0) {
         patchSessionLoadTraceStage(prioritizedSessionIds, 'messageCount', 'loading')
         const priorityResult = await window.electronAPI.chat.getSessionMessageCounts(prioritizedSessionIds)
@@ -3311,9 +3579,6 @@ function ExportPage() {
         }
       }
 
-      if (detailStatsPriorityRef.current) {
-        return { ...accumulatedCounts }
-      }
       if (remainingSessionIds.length > 0) {
         patchSessionLoadTraceStage(remainingSessionIds, 'messageCount', 'loading')
         const remainingResult = await window.electronAPI.chat.getSessionMessageCounts(remainingSessionIds)
@@ -3658,10 +3923,12 @@ function ExportPage() {
               displayName: contact.displayName || contact.username,
               remark: contact.remark,
               nickname: contact.nickname,
+              alias: contact.alias,
               type: contact.type
             }))
 
             const persistAt = Date.now()
+            setContactsList(contactsForPersist)
             setSessions(nextSessions)
             sessionsHydratedAtRef.current = persistAt
             if (hasNetworkContactsSnapshot && contactsCachePayload.length > 0) {
@@ -3805,6 +4072,7 @@ function ExportPage() {
   const openExportDialog = useCallback((payload: Omit<ExportDialogState, 'open'>) => {
     setExportDialog({ open: true, ...payload })
     setIsTimeRangeDialogOpen(false)
+    setTimeRangeBounds(null)
     setTimeRangeSelection(exportDefaultDateRangeSelection)
 
     setOptions(prev => {
@@ -3828,7 +4096,8 @@ function ExportPage() {
         exportEmojis: exportDefaultMedia.emojis,
         exportVoiceAsText: exportDefaultVoiceAsText,
         excelCompactColumns: exportDefaultExcelCompactColumns,
-        exportConcurrency: exportDefaultConcurrency
+        exportConcurrency: exportDefaultConcurrency,
+        imageDeepSearchOnMiss: exportDefaultImageDeepSearchOnMiss
       }
 
       if (payload.scope === 'sns') {
@@ -3861,17 +4130,150 @@ function ExportPage() {
     exportDefaultAvatars,
     exportDefaultMedia,
     exportDefaultVoiceAsText,
-    exportDefaultConcurrency
+    exportDefaultConcurrency,
+    exportDefaultImageDeepSearchOnMiss
   ])
 
   const closeExportDialog = useCallback(() => {
     setExportDialog(prev => ({ ...prev, open: false }))
     setIsTimeRangeDialogOpen(false)
+    setTimeRangeBounds(null)
   }, [])
 
+  const resolveChatExportTimeRangeBounds = useCallback(async (sessionIds: string[]): Promise<TimeRangeBounds | null> => {
+    const normalizedSessionIds = Array.from(new Set((sessionIds || []).map(id => String(id || '').trim()).filter(Boolean)))
+    if (normalizedSessionIds.length === 0) return null
+
+    const sessionRowMap = new Map<string, SessionRow>()
+    for (const session of sessions) {
+      sessionRowMap.set(session.username, session)
+    }
+
+    let minTimestamp: number | undefined
+    let maxTimestamp: number | undefined
+    const resolvedSessionBounds = new Map<string, { hasMin: boolean; hasMax: boolean }>()
+
+    const absorbMetric = (sessionId: string, metric?: { firstTimestamp?: number; lastTimestamp?: number } | null) => {
+      if (!metric) return
+      const firstTimestamp = normalizeTimestampSeconds(metric.firstTimestamp)
+      const lastTimestamp = normalizeTimestampSeconds(metric.lastTimestamp)
+      if (typeof firstTimestamp !== 'number' && typeof lastTimestamp !== 'number') return
+
+      const previous = resolvedSessionBounds.get(sessionId) || { hasMin: false, hasMax: false }
+      const nextState = {
+        hasMin: previous.hasMin || typeof firstTimestamp === 'number',
+        hasMax: previous.hasMax || typeof lastTimestamp === 'number'
+      }
+      resolvedSessionBounds.set(sessionId, nextState)
+
+      if (typeof firstTimestamp === 'number' && (minTimestamp === undefined || firstTimestamp < minTimestamp)) {
+        minTimestamp = firstTimestamp
+      }
+      if (typeof lastTimestamp === 'number' && (maxTimestamp === undefined || lastTimestamp > maxTimestamp)) {
+        maxTimestamp = lastTimestamp
+      }
+    }
+
+    for (const sessionId of normalizedSessionIds) {
+      const sessionRow = sessionRowMap.get(sessionId)
+      absorbMetric(sessionId, {
+        firstTimestamp: undefined,
+        lastTimestamp: sessionRow?.sortTimestamp || sessionRow?.lastTimestamp
+      })
+      absorbMetric(sessionId, sessionContentMetrics[sessionId])
+      if (sessionDetail?.wxid === sessionId) {
+        absorbMetric(sessionId, {
+          firstTimestamp: sessionDetail.firstMessageTime,
+          lastTimestamp: sessionDetail.latestMessageTime
+        })
+      }
+    }
+
+    const applyStatsResult = (result?: {
+      success: boolean
+      data?: Record<string, SessionExportMetric>
+    } | null) => {
+      if (!result?.success || !result.data) return
+      applySessionMediaMetricsFromStats(result.data)
+      for (const sessionId of normalizedSessionIds) {
+        absorbMetric(sessionId, result.data[sessionId])
+      }
+    }
+
+    const missingSessionIds = () => normalizedSessionIds.filter(sessionId => {
+      const resolved = resolvedSessionBounds.get(sessionId)
+      return !resolved?.hasMin || !resolved?.hasMax
+    })
+
+    const staleSessionIds = new Set<string>()
+
+    if (missingSessionIds().length > 0) {
+      const cacheResult = await window.electronAPI.chat.getExportSessionStats(
+        missingSessionIds(),
+        { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+      )
+      applyStatsResult(cacheResult)
+      for (const sessionId of cacheResult?.needsRefresh || []) {
+        staleSessionIds.add(String(sessionId || '').trim())
+      }
+    }
+
+    const sessionsNeedingFreshStats = Array.from(new Set([
+      ...missingSessionIds(),
+      ...Array.from(staleSessionIds).filter(Boolean)
+    ]))
+
+    if (sessionsNeedingFreshStats.length > 0) {
+      applyStatsResult(await window.electronAPI.chat.getExportSessionStats(
+        sessionsNeedingFreshStats,
+        { includeRelations: false }
+      ))
+    }
+
+    if (missingSessionIds().length > 0) {
+      return null
+    }
+    if (typeof minTimestamp !== 'number' || typeof maxTimestamp !== 'number') {
+      return null
+    }
+
+    return {
+      minDate: new Date(minTimestamp * 1000),
+      maxDate: new Date(maxTimestamp * 1000)
+    }
+  }, [applySessionMediaMetricsFromStats, sessionContentMetrics, sessionDetail, sessions])
+
   const openTimeRangeDialog = useCallback(() => {
-    setIsTimeRangeDialogOpen(true)
-  }, [])
+    void (async () => {
+      if (isResolvingTimeRangeBounds) return
+      setIsResolvingTimeRangeBounds(true)
+      try {
+        let nextBounds: TimeRangeBounds | null = null
+        if (exportDialog.scope !== 'sns') {
+          nextBounds = await resolveChatExportTimeRangeBounds(exportDialog.sessionIds)
+        }
+        setTimeRangeBounds(nextBounds)
+        if (nextBounds) {
+          const nextSelection = clampExportSelectionToBounds(timeRangeSelection, nextBounds)
+          if (!areExportSelectionsEqual(nextSelection, timeRangeSelection)) {
+            setTimeRangeSelection(nextSelection)
+            setOptions(prev => ({
+              ...prev,
+              useAllTime: nextSelection.useAllTime,
+              dateRange: cloneExportDateRange(nextSelection.dateRange)
+            }))
+          }
+        }
+        setIsTimeRangeDialogOpen(true)
+      } catch (error) {
+        console.error('导出页解析时间范围边界失败', error)
+        setTimeRangeBounds(null)
+        setIsTimeRangeDialogOpen(true)
+      } finally {
+        setIsResolvingTimeRangeBounds(false)
+      }
+    })()
+  }, [exportDialog.scope, exportDialog.sessionIds, isResolvingTimeRangeBounds, resolveChatExportTimeRangeBounds, timeRangeSelection])
 
   const closeTimeRangeDialog = useCallback(() => {
     setIsTimeRangeDialogOpen(false)
@@ -3948,6 +4350,7 @@ function ExportPage() {
       txtColumns: options.txtColumns,
       displayNamePreference: options.displayNamePreference,
       exportConcurrency: options.exportConcurrency,
+      imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
       sessionLayout,
       sessionNameWithTypePrefix,
       dateRange: options.useAllTime
@@ -4135,6 +4538,168 @@ function ExportPage() {
 
     progressUnsubscribeRef.current?.()
     const settledSessionIdsFromProgress = new Set<string>()
+    const sessionMessageProgress = new Map<string, { exported: number; total: number; knownTotal: boolean }>()
+    let queuedProgressPayload: ExportProgress | null = null
+    let queuedProgressRaf: number | null = null
+    let queuedProgressTimer: number | null = null
+
+    const clearQueuedProgress = () => {
+      if (queuedProgressRaf !== null) {
+        window.cancelAnimationFrame(queuedProgressRaf)
+        queuedProgressRaf = null
+      }
+      if (queuedProgressTimer !== null) {
+        window.clearTimeout(queuedProgressTimer)
+        queuedProgressTimer = null
+      }
+    }
+
+    const updateSessionMessageProgress = (payload: ExportProgress) => {
+      const sessionId = String(payload.currentSessionId || '').trim()
+      if (!sessionId) return
+      const prev = sessionMessageProgress.get(sessionId) || { exported: 0, total: 0, knownTotal: false }
+      const nextExported = Number.isFinite(payload.exportedMessages)
+        ? Math.max(prev.exported, Math.max(0, Math.floor(Number(payload.exportedMessages || 0))))
+        : prev.exported
+      const hasEstimatedTotal = Number.isFinite(payload.estimatedTotalMessages)
+      const nextTotal = hasEstimatedTotal
+        ? Math.max(prev.total, Math.max(0, Math.floor(Number(payload.estimatedTotalMessages || 0))))
+        : prev.total
+      const knownTotal = prev.knownTotal || hasEstimatedTotal
+      sessionMessageProgress.set(sessionId, {
+        exported: nextExported,
+        total: nextTotal,
+        knownTotal
+      })
+    }
+
+    const resolveAggregatedMessageProgress = () => {
+      let exported = 0
+      let estimated = 0
+      let allKnown = true
+      for (const sessionId of next.payload.sessionIds) {
+        const entry = sessionMessageProgress.get(sessionId)
+        if (!entry) {
+          allKnown = false
+          continue
+        }
+        exported += entry.exported
+        estimated += entry.total
+        if (!entry.knownTotal) {
+          allKnown = false
+        }
+      }
+      return {
+        exported: Math.max(0, Math.floor(exported)),
+        estimated: allKnown ? Math.max(0, Math.floor(estimated)) : 0
+      }
+    }
+
+    const flushQueuedProgress = () => {
+      if (!queuedProgressPayload) return
+      const payload = queuedProgressPayload
+      queuedProgressPayload = null
+      const now = Date.now()
+      const currentSessionId = String(payload.currentSessionId || '').trim()
+      updateTask(next.id, task => {
+        if (task.status !== 'running') return task
+        const performance = applyProgressToTaskPerformance(task, payload, now)
+        const settledSessionIds = task.settledSessionIds || []
+        const nextSettledSessionIds = (
+          payload.phase === 'complete' &&
+          currentSessionId &&
+          !settledSessionIds.includes(currentSessionId)
+        )
+          ? [...settledSessionIds, currentSessionId]
+          : settledSessionIds
+        const aggregatedMessageProgress = resolveAggregatedMessageProgress()
+        const collectedMessages = Number.isFinite(payload.collectedMessages)
+          ? Math.max(0, Math.floor(Number(payload.collectedMessages || 0)))
+          : task.progress.collectedMessages
+        const writtenFiles = Number.isFinite(payload.writtenFiles)
+          ? Math.max(task.progress.writtenFiles, Math.max(0, Math.floor(Number(payload.writtenFiles || 0))))
+          : task.progress.writtenFiles
+        const prevMediaDoneFiles = Number.isFinite(task.progress.mediaDoneFiles)
+          ? Math.max(0, Math.floor(Number(task.progress.mediaDoneFiles || 0)))
+          : 0
+        const prevMediaCacheHitFiles = Number.isFinite(task.progress.mediaCacheHitFiles)
+          ? Math.max(0, Math.floor(Number(task.progress.mediaCacheHitFiles || 0)))
+          : 0
+        const prevMediaCacheMissFiles = Number.isFinite(task.progress.mediaCacheMissFiles)
+          ? Math.max(0, Math.floor(Number(task.progress.mediaCacheMissFiles || 0)))
+          : 0
+        const prevMediaCacheFillFiles = Number.isFinite(task.progress.mediaCacheFillFiles)
+          ? Math.max(0, Math.floor(Number(task.progress.mediaCacheFillFiles || 0)))
+          : 0
+        const prevMediaDedupReuseFiles = Number.isFinite(task.progress.mediaDedupReuseFiles)
+          ? Math.max(0, Math.floor(Number(task.progress.mediaDedupReuseFiles || 0)))
+          : 0
+        const prevMediaBytesWritten = Number.isFinite(task.progress.mediaBytesWritten)
+          ? Math.max(0, Math.floor(Number(task.progress.mediaBytesWritten || 0)))
+          : 0
+        const mediaDoneFiles = Number.isFinite(payload.mediaDoneFiles)
+          ? Math.max(prevMediaDoneFiles, Math.max(0, Math.floor(Number(payload.mediaDoneFiles || 0))))
+          : prevMediaDoneFiles
+        const mediaCacheHitFiles = Number.isFinite(payload.mediaCacheHitFiles)
+          ? Math.max(prevMediaCacheHitFiles, Math.max(0, Math.floor(Number(payload.mediaCacheHitFiles || 0))))
+          : prevMediaCacheHitFiles
+        const mediaCacheMissFiles = Number.isFinite(payload.mediaCacheMissFiles)
+          ? Math.max(prevMediaCacheMissFiles, Math.max(0, Math.floor(Number(payload.mediaCacheMissFiles || 0))))
+          : prevMediaCacheMissFiles
+        const mediaCacheFillFiles = Number.isFinite(payload.mediaCacheFillFiles)
+          ? Math.max(prevMediaCacheFillFiles, Math.max(0, Math.floor(Number(payload.mediaCacheFillFiles || 0))))
+          : prevMediaCacheFillFiles
+        const mediaDedupReuseFiles = Number.isFinite(payload.mediaDedupReuseFiles)
+          ? Math.max(prevMediaDedupReuseFiles, Math.max(0, Math.floor(Number(payload.mediaDedupReuseFiles || 0))))
+          : prevMediaDedupReuseFiles
+        const mediaBytesWritten = Number.isFinite(payload.mediaBytesWritten)
+          ? Math.max(prevMediaBytesWritten, Math.max(0, Math.floor(Number(payload.mediaBytesWritten || 0))))
+          : prevMediaBytesWritten
+        return {
+          ...task,
+          progress: {
+            current: payload.current,
+            total: payload.total,
+            currentName: payload.currentSession,
+            phase: payload.phase,
+            phaseLabel: payload.phaseLabel || '',
+            phaseProgress: payload.phaseProgress || 0,
+            phaseTotal: payload.phaseTotal || 0,
+            exportedMessages: Math.max(task.progress.exportedMessages, aggregatedMessageProgress.exported),
+            estimatedTotalMessages: aggregatedMessageProgress.estimated > 0
+              ? Math.max(task.progress.estimatedTotalMessages, aggregatedMessageProgress.estimated)
+              : (task.progress.estimatedTotalMessages > 0 ? task.progress.estimatedTotalMessages : 0),
+            collectedMessages: Math.max(task.progress.collectedMessages, collectedMessages),
+            writtenFiles,
+            mediaDoneFiles,
+            mediaCacheHitFiles,
+            mediaCacheMissFiles,
+            mediaCacheFillFiles,
+            mediaDedupReuseFiles,
+            mediaBytesWritten
+          },
+          settledSessionIds: nextSettledSessionIds,
+          performance
+        }
+      })
+    }
+
+    const queueProgressUpdate = (payload: ExportProgress) => {
+      queuedProgressPayload = payload
+      if (payload.phase === 'complete') {
+        clearQueuedProgress()
+        flushQueuedProgress()
+        return
+      }
+      if (queuedProgressRaf !== null || queuedProgressTimer !== null) return
+      queuedProgressRaf = window.requestAnimationFrame(() => {
+        queuedProgressRaf = null
+        queuedProgressTimer = window.setTimeout(() => {
+          queuedProgressTimer = null
+          flushQueuedProgress()
+        }, 100)
+      })
+    }
     if (next.payload.scope === 'sns') {
       progressUnsubscribeRef.current = window.electronAPI.sns.onExportProgress((payload) => {
         updateTask(next.id, task => {
@@ -4148,7 +4713,17 @@ function ExportPage() {
               phase: 'exporting',
               phaseLabel: payload.status || '',
               phaseProgress: payload.total > 0 ? payload.current : 0,
-              phaseTotal: payload.total || 0
+              phaseTotal: payload.total || 0,
+              exportedMessages: payload.total > 0 ? Math.max(0, Math.floor(payload.current || 0)) : task.progress.exportedMessages,
+              estimatedTotalMessages: payload.total > 0 ? Math.max(0, Math.floor(payload.total || 0)) : task.progress.estimatedTotalMessages,
+              collectedMessages: task.progress.collectedMessages,
+              writtenFiles: task.progress.writtenFiles,
+              mediaDoneFiles: task.progress.mediaDoneFiles,
+              mediaCacheHitFiles: task.progress.mediaCacheHitFiles,
+              mediaCacheMissFiles: task.progress.mediaCacheMissFiles,
+              mediaCacheFillFiles: task.progress.mediaCacheFillFiles,
+              mediaDedupReuseFiles: task.progress.mediaDedupReuseFiles,
+              mediaBytesWritten: task.progress.mediaBytesWritten
             }
           }
         })
@@ -4157,6 +4732,7 @@ function ExportPage() {
       progressUnsubscribeRef.current = window.electronAPI.export.onProgress((payload: ExportProgress) => {
         const now = Date.now()
         const currentSessionId = String(payload.currentSessionId || '').trim()
+        updateSessionMessageProgress(payload)
         if (payload.phase === 'complete' && currentSessionId && !settledSessionIdsFromProgress.has(currentSessionId)) {
           settledSessionIdsFromProgress.add(currentSessionId)
           const phaseLabel = String(payload.phaseLabel || '')
@@ -4172,33 +4748,7 @@ function ExportPage() {
             markSessionExportRecords([currentSessionId], taskExportContentLabel, next.payload.outputDir, now)
           }
         }
-
-        updateTask(next.id, task => {
-          if (task.status !== 'running') return task
-          const performance = applyProgressToTaskPerformance(task, payload, now)
-          const settledSessionIds = task.settledSessionIds || []
-          const nextSettledSessionIds = (
-            payload.phase === 'complete' &&
-            currentSessionId &&
-            !settledSessionIds.includes(currentSessionId)
-          )
-            ? [...settledSessionIds, currentSessionId]
-            : settledSessionIds
-          return {
-            ...task,
-            progress: {
-              current: payload.current,
-              total: payload.total,
-              currentName: payload.currentSession,
-              phase: payload.phase,
-              phaseLabel: payload.phaseLabel || '',
-              phaseProgress: payload.phaseProgress || 0,
-              phaseTotal: payload.phaseTotal || 0
-            },
-            settledSessionIds: nextSettledSessionIds,
-            performance
-          }
-        })
+        queueProgressUpdate(payload)
       })
     }
 
@@ -4310,6 +4860,8 @@ function ExportPage() {
         performance: finalizeTaskPerformance(task, doneAt)
       }))
     } finally {
+      clearQueuedProgress()
+      flushQueuedProgress()
       progressUnsubscribeRef.current?.()
       progressUnsubscribeRef.current = null
       runningTaskIdRef.current = null
@@ -4391,6 +4943,8 @@ function ExportPage() {
     await configService.setExportDefaultExcelCompactColumns(options.excelCompactColumns)
     await configService.setExportDefaultTxtColumns(options.txtColumns)
     await configService.setExportDefaultConcurrency(options.exportConcurrency)
+    await configService.setExportDefaultImageDeepSearchOnMiss(options.imageDeepSearchOnMiss)
+    setExportDefaultImageDeepSearchOnMiss(options.imageDeepSearchOnMiss)
   }
 
   const openSingleExport = useCallback((session: SessionRow) => {
@@ -4715,10 +5269,22 @@ function ExportPage() {
     return new Date(value).toLocaleTimeString('zh-CN', { hour12: false })
   }, [])
 
-  const getLoadDetailStatusLabel = useCallback((loaded: number, total: number, hasStarted: boolean): string => {
+  const getLoadDetailStatusLabel = useCallback((
+    loaded: number,
+    total: number,
+    hasStarted: boolean,
+    hasLoading: boolean,
+    failedCount: number
+  ): string => {
     if (total <= 0) return '待加载'
-    if (loaded >= total) return `已完成 ${total}`
-    if (hasStarted) return `加载中 ${loaded}/${total}`
+    const terminalCount = loaded + failedCount
+    if (terminalCount >= total) {
+      if (failedCount > 0) return `已完成 ${loaded}/${total}（失败 ${failedCount}）`
+      return `已完成 ${total}`
+    }
+    if (hasLoading) return `加载中 ${loaded}/${total}`
+    if (hasStarted && failedCount > 0) return `已完成 ${loaded}/${total}（失败 ${failedCount}）`
+    if (hasStarted) return `已完成 ${loaded}/${total}`
     return '待加载'
   }, [])
 
@@ -4728,7 +5294,9 @@ function ExportPage() {
   ): SessionLoadStageSummary => {
     const total = sessionIds.length
     let loaded = 0
+    let failedCount = 0
     let hasStarted = false
+    let hasLoading = false
     let earliestStart: number | undefined
     let latestFinish: number | undefined
     let latestProgressAt: number | undefined
@@ -4741,6 +5309,12 @@ function ExportPage() {
             ? stage.finishedAt
             : Math.max(latestProgressAt, stage.finishedAt)
         }
+      }
+      if (stage?.status === 'failed') {
+        failedCount += 1
+      }
+      if (stage?.status === 'loading') {
+        hasLoading = true
       }
       if (stage?.status === 'loading' || stage?.status === 'failed' || typeof stage?.startedAt === 'number') {
         hasStarted = true
@@ -4759,9 +5333,9 @@ function ExportPage() {
     return {
       total,
       loaded,
-      statusLabel: getLoadDetailStatusLabel(loaded, total, hasStarted),
+      statusLabel: getLoadDetailStatusLabel(loaded, total, hasStarted, hasLoading, failedCount),
       startedAt: earliestStart,
-      finishedAt: loaded >= total ? latestFinish : undefined,
+      finishedAt: (loaded + failedCount) >= total ? latestFinish : undefined,
       latestProgressAt
     }
   }, [getLoadDetailStatusLabel, sessionLoadTraceMap])
@@ -4907,7 +5481,11 @@ function ExportPage() {
     const endIndex = Number.isFinite(range?.endIndex) ? Math.max(startIndex, Math.floor(range.endIndex)) : startIndex
     sessionMediaMetricVisibleRangeRef.current = { startIndex, endIndex }
     sessionMutualFriendsVisibleRangeRef.current = { startIndex, endIndex }
-    if (isLoadingSessionCountsRef.current || !isSessionCountStageReady) return
+    void hydrateVisibleContactAvatars(
+      filteredContacts
+        .slice(startIndex, endIndex + 1)
+        .map((contact) => contact.username)
+    )
     const visibleTargets = collectVisibleSessionMetricTargets(filteredContacts)
     if (visibleTargets.length === 0) return
     enqueueSessionMediaMetricRequests(visibleTargets, { front: true })
@@ -4923,13 +5501,26 @@ function ExportPage() {
     enqueueSessionMediaMetricRequests,
     enqueueSessionMutualFriendsRequests,
     filteredContacts,
-    isSessionCountStageReady,
+    hydrateVisibleContactAvatars,
     scheduleSessionMediaMetricWorker,
     scheduleSessionMutualFriendsWorker
   ])
 
   useEffect(() => {
-    if (!isSessionCountStageReady || filteredContacts.length === 0) return
+    if (filteredContacts.length === 0) return
+    const bootstrapTargets = filteredContacts.slice(0, 24).map((contact) => contact.username)
+    void hydrateVisibleContactAvatars(bootstrapTargets)
+  }, [filteredContacts, hydrateVisibleContactAvatars])
+
+  useEffect(() => {
+    const sessionId = String(sessionDetail?.wxid || '').trim()
+    if (!sessionId) return
+    void hydrateVisibleContactAvatars([sessionId])
+  }, [hydrateVisibleContactAvatars, sessionDetail?.wxid])
+
+  useEffect(() => {
+    if (activeTaskCount > 0) return
+    if (filteredContacts.length === 0) return
     const runId = sessionMediaMetricRunIdRef.current
     const visibleTargets = collectVisibleSessionMetricTargets(filteredContacts)
     if (visibleTargets.length > 0) {
@@ -4946,7 +5537,6 @@ function ExportPage() {
     let cursor = 0
     const feedNext = () => {
       if (runId !== sessionMediaMetricRunIdRef.current) return
-      if (isLoadingSessionCountsRef.current) return
       const batchIds: string[] = []
       while (cursor < filteredContacts.length && batchIds.length < SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE) {
         const contact = filteredContacts[cursor]
@@ -4976,15 +5566,61 @@ function ExportPage() {
       }
     }
   }, [
+    activeTaskCount,
     collectVisibleSessionMetricTargets,
     enqueueSessionMediaMetricRequests,
     filteredContacts,
-    isSessionCountStageReady,
     scheduleSessionMediaMetricWorker,
     sessionRowByUsername
   ])
 
   useEffect(() => {
+    if (activeTaskCount > 0) return
+    const runId = sessionMediaMetricRunIdRef.current
+    const allTargets = [
+      ...(loadDetailTargetsByTab.private || []),
+      ...(loadDetailTargetsByTab.group || []),
+      ...(loadDetailTargetsByTab.former_friend || [])
+    ]
+    if (allTargets.length === 0) return
+
+    let timer: number | null = null
+    let cursor = 0
+    const feedNext = () => {
+      if (runId !== sessionMediaMetricRunIdRef.current) return
+      const batchIds: string[] = []
+      while (cursor < allTargets.length && batchIds.length < SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE) {
+        const sessionId = allTargets[cursor]
+        cursor += 1
+        if (!sessionId) continue
+        batchIds.push(sessionId)
+      }
+      if (batchIds.length > 0) {
+        enqueueSessionMediaMetricRequests(batchIds)
+        scheduleSessionMediaMetricWorker()
+      }
+      if (cursor < allTargets.length) {
+        timer = window.setTimeout(feedNext, SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS)
+      }
+    }
+
+    feedNext()
+    return () => {
+      if (timer !== null) {
+        window.clearTimeout(timer)
+      }
+    }
+  }, [
+    activeTaskCount,
+    enqueueSessionMediaMetricRequests,
+    loadDetailTargetsByTab.former_friend,
+    loadDetailTargetsByTab.group,
+    loadDetailTargetsByTab.private,
+    scheduleSessionMediaMetricWorker
+  ])
+
+  useEffect(() => {
+    if (activeTaskCount > 0) return
     if (!isSessionCountStageReady || filteredContacts.length === 0) return
     const runId = sessionMutualFriendsRunIdRef.current
     const visibleTargets = collectVisibleSessionMutualFriendsTargets(filteredContacts)
@@ -5031,6 +5667,7 @@ function ExportPage() {
       }
     }
   }, [
+    activeTaskCount,
     collectVisibleSessionMutualFriendsTargets,
     enqueueSessionMutualFriendsRequests,
     filteredContacts,
@@ -5074,6 +5711,45 @@ function ExportPage() {
     }
     return map
   }, [contactsList])
+
+  useEffect(() => {
+    if (!showSessionDetailPanel) return
+    const sessionId = String(sessionDetail?.wxid || '').trim()
+    if (!sessionId) return
+
+    const mappedSession = sessionRowByUsername.get(sessionId)
+    const mappedContact = contactByUsername.get(sessionId)
+    if (!mappedSession && !mappedContact) return
+
+    setSessionDetail((prev) => {
+      if (!prev || prev.wxid !== sessionId) return prev
+
+      const nextDisplayName = mappedSession?.displayName || mappedContact?.displayName || prev.displayName || sessionId
+      const nextRemark = mappedContact?.remark ?? prev.remark
+      const nextNickName = mappedContact?.nickname ?? prev.nickName
+      const nextAlias = mappedContact?.alias ?? prev.alias
+      const nextAvatarUrl = mappedSession?.avatarUrl || mappedContact?.avatarUrl || prev.avatarUrl
+
+      if (
+        nextDisplayName === prev.displayName &&
+        nextRemark === prev.remark &&
+        nextNickName === prev.nickName &&
+        nextAlias === prev.alias &&
+        nextAvatarUrl === prev.avatarUrl
+      ) {
+        return prev
+      }
+
+      return {
+        ...prev,
+        displayName: nextDisplayName,
+        remark: nextRemark,
+        nickName: nextNickName,
+        alias: nextAlias,
+        avatarUrl: nextAvatarUrl
+      }
+    })
+  }, [contactByUsername, sessionDetail?.wxid, sessionRowByUsername, showSessionDetailPanel])
 
   const currentSessionExportRecords = useMemo(() => {
     const sessionId = String(sessionDetail?.wxid || '').trim()
@@ -5193,7 +5869,7 @@ function ExportPage() {
         displayName: mappedSession?.displayName || mappedContact?.displayName || prev?.displayName || normalizedSessionId,
         remark: sameSession ? prev?.remark : mappedContact?.remark,
         nickName: sameSession ? prev?.nickName : mappedContact?.nickname,
-        alias: sameSession ? prev?.alias : undefined,
+        alias: sameSession ? prev?.alias : mappedContact?.alias,
         avatarUrl: mappedSession?.avatarUrl || mappedContact?.avatarUrl || (sameSession ? prev?.avatarUrl : undefined),
         messageCount: initialMessageCount ?? (sameSession ? prev.messageCount : Number.NaN),
         voiceMessages: metricVoice ?? (sameSession ? prev?.voiceMessages : undefined),
@@ -5348,16 +6024,16 @@ function ExportPage() {
 
       const lastPreciseAt = sessionPreciseRefreshAtRef.current[preciseCacheKey] || 0
       const hasRecentPrecise = Date.now() - lastPreciseAt <= DETAIL_PRECISE_REFRESH_COOLDOWN_MS
-      const shouldRunPreciseRefresh = !hasRecentPrecise && (!quickMetric || Boolean(quickCacheMeta?.stale))
+      const shouldRunBackgroundRefresh = !hasRecentPrecise && (!quickMetric || Boolean(quickCacheMeta?.stale))
 
-      if (shouldRunPreciseRefresh) {
+      if (shouldRunBackgroundRefresh) {
         setIsRefreshingSessionDetailStats(true)
         void (async () => {
           try {
-            // 后台精确补算三类重字段（转账/红包/通话），不阻塞首屏基础统计显示。
+            // 后台补齐非关系统计，不走精确特型扫描，避免阻塞列表统计队列。
             const freshResult = await window.electronAPI.chat.getExportSessionStats(
               [normalizedSessionId],
-              { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
+              { includeRelations: false, forceRefresh: true }
             )
             if (requestSeq !== detailRequestSeqRef.current) return
             if (freshResult.success && freshResult.data) {
@@ -5480,7 +6156,11 @@ function ExportPage() {
       loadSnsUserPostCounts({ force: true })
     ])
 
-    if (String(sessionDetail?.wxid || '').trim()) {
+    const currentDetailSessionId = showSessionDetailPanel
+      ? String(sessionDetail?.wxid || '').trim()
+      : ''
+    if (currentDetailSessionId) {
+      await loadSessionDetail(currentDetailSessionId)
       void loadSessionRelationStats({ forceRefresh: true })
     }
   }, [
@@ -5491,11 +6171,13 @@ function ExportPage() {
     filteredContacts,
     isSessionCountStageReady,
     loadContactsList,
+    loadSessionDetail,
     loadSessionRelationStats,
     loadSnsStats,
     loadSnsUserPostCounts,
     resetSessionMutualFriendsLoader,
     scheduleSessionMutualFriendsWorker,
+    showSessionDetailPanel,
     sessionDetail?.wxid
   ])
 
@@ -5763,6 +6445,10 @@ function ExportPage() {
   const useCollapsedSessionFormatSelector = isSessionScopeDialog || isContentTextDialog
   const shouldShowFormatSection = !isContentScopeDialog || isContentTextDialog
   const shouldShowMediaSection = !isContentScopeDialog
+  const shouldShowImageDeepSearchToggle = exportDialog.scope !== 'sns' && (
+    (isSessionScopeDialog && options.exportImages) ||
+    (isContentScopeDialog && exportDialog.contentType === 'image')
+  )
   const avatarExportStatusLabel = options.exportAvatars ? '已开启聊天消息导出带头像' : '已关闭聊天消息导出带头像'
   const contentTextDialogSummary = '此模式只导出聊天文本，不包含图片语音视频表情包等多媒体文件。'
   const activeDialogFormatLabel = exportDialog.scope === 'sns'
@@ -6060,11 +6746,12 @@ function ExportPage() {
               </button>
             </div>
             <div className="contact-avatar">
-              {contact.avatarUrl ? (
-                <img src={contact.avatarUrl} alt="" loading="lazy" />
-              ) : (
-                <span>{getAvatarLetter(contact.displayName)}</span>
-              )}
+              <Avatar
+                src={normalizeExportAvatarUrl(contact.avatarUrl)}
+                name={contact.displayName}
+                size="100%"
+                shape="rounded"
+              />
             </div>
             <div className="contact-info">
               <div className="contact-name">{contact.displayName}</div>
@@ -6083,14 +6770,10 @@ function ExportPage() {
               <button
                 type="button"
                 className="row-open-chat-link"
-                title="在新窗口打开该会话"
+                title="切换到聊天页查看该会话"
                 onClick={() => {
-                  void window.electronAPI.window.openSessionChatWindow(contact.username, {
-                    source: 'export',
-                    initialDisplayName: contact.displayName || contact.username,
-                    initialAvatarUrl: contact.avatarUrl,
-                    initialContactType: contact.type
-                  })
+                  setCurrentSession(contact.username)
+                  navigate('/chat')
                 }}
               >
                 {openChatLabel}
@@ -6198,6 +6881,7 @@ function ExportPage() {
     )
   }, [
     lastExportBySession,
+    navigate,
     nowTick,
     openContactSnsTimeline,
     openSessionDetail,
@@ -6219,6 +6903,7 @@ function ExportPage() {
     shouldShowSnsColumn,
     snsUserPostCounts,
     snsUserPostCountsStatus,
+    setCurrentSession,
     toggleSelectSession
   ])
   const handleContactsListWheelCapture = useCallback((event: WheelEvent<HTMLDivElement>) => {
@@ -6949,11 +7634,12 @@ function ExportPage() {
                 <div className="session-mutual-friends-header">
                   <div className="session-mutual-friends-header-main">
                     <div className="session-mutual-friends-avatar">
-                      {sessionMutualFriendsDialogTarget.avatarUrl ? (
-                        <img src={sessionMutualFriendsDialogTarget.avatarUrl} alt="" />
-                      ) : (
-                        <span>{getAvatarLetter(sessionMutualFriendsDialogTarget.displayName)}</span>
-                      )}
+                      <Avatar
+                        src={normalizeExportAvatarUrl(sessionMutualFriendsDialogTarget.avatarUrl)}
+                        name={sessionMutualFriendsDialogTarget.displayName}
+                        size="100%"
+                        shape="rounded"
+                      />
                     </div>
                     <div className="session-mutual-friends-meta">
                       <h4>{sessionMutualFriendsDialogTarget.displayName} 的共同好友</h4>
@@ -7034,11 +7720,12 @@ function ExportPage() {
               <div className="detail-header">
                 <div className="detail-header-main">
                   <div className="detail-header-avatar">
-                    {sessionDetail?.avatarUrl ? (
-                      <img src={sessionDetail.avatarUrl} alt="" />
-                    ) : (
-                      <span>{getAvatarLetter(sessionDetail?.displayName || sessionDetail?.wxid || '')}</span>
-                    )}
+                    <Avatar
+                      src={normalizeExportAvatarUrl(sessionDetail?.avatarUrl)}
+                      name={sessionDetail?.displayName || sessionDetail?.wxid || ''}
+                      size="100%"
+                      shape="rounded"
+                    />
                   </div>
                   <div className="detail-header-meta">
                     <h4>{sessionDetail?.displayName || '会话详情'}</h4>
@@ -7448,8 +8135,9 @@ function ExportPage() {
                     type="button"
                     className="time-range-trigger"
                     onClick={openTimeRangeDialog}
+                    disabled={isResolvingTimeRangeBounds}
                   >
-                    <span>{timeRangeSummaryLabel}</span>
+                    <span>{isResolvingTimeRangeBounds ? '正在统计可选时间...' : timeRangeSummaryLabel}</span>
                     <span className="time-range-arrow">&gt;</span>
                   </button>
                 </div>
@@ -7477,6 +8165,26 @@ function ExportPage() {
                   {exportDialog.scope === 'sns' && (
                     <div className="format-note">全不勾选时仅导出文本信息，不导出媒体文件。</div>
                   )}
+                </div>
+              )}
+
+              {shouldShowImageDeepSearchToggle && (
+                <div className="dialog-section">
+                  <div className="dialog-switch-row">
+                    <div className="dialog-switch-copy">
+                      <h4>缺图时深度搜索</h4>
+                      <div className="format-note">关闭后仅尝试 hardlink 命中，未命中将直接显示占位符，导出速度更快。</div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`dialog-switch ${options.imageDeepSearchOnMiss ? 'on' : ''}`}
+                      aria-pressed={options.imageDeepSearchOnMiss}
+                      aria-label="切换缺图时深度搜索"
+                      onClick={() => setOptions(prev => ({ ...prev, imageDeepSearchOnMiss: !prev.imageDeepSearchOnMiss }))}
+                    >
+                      <span className="dialog-switch-thumb" />
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -7535,6 +8243,8 @@ function ExportPage() {
             <ExportDateRangeDialog
               open={isTimeRangeDialogOpen}
               value={timeRangeSelection}
+              minDate={timeRangeBounds?.minDate}
+              maxDate={timeRangeBounds?.maxDate}
               onClose={closeTimeRangeDialog}
               onConfirm={(nextSelection) => {
                 setTimeRangeSelection(nextSelection)

@@ -136,7 +136,7 @@ export class KeyServiceMac {
       if (sipStatus.enabled) {
         return {
           success: false,
-          error: 'SIP (系统完整性保护) 已开启，无法获取密钥。请关闭 SIP 后重试。\n\n关闭方法：\n1. 重启 Mac 并按住 Command + R 进入恢复模式\n2. 打开终端，输入: csrutil disable\n3. 重启电脑'
+          error: 'SIP (系统完整性保护) 已开启，无法获取密钥。请关闭 SIP 后重试。\n\n关闭方法：\n1. Intel 芯片：重启 Mac 并按住 Command + R 进入恢复模式\n2. Apple 芯片（M 系列）：关机后长按开机（指纹）键，选择“设置（选项）”进入恢复模式\n3. 打开终端，输入: csrutil disable\n4. 重启电脑'
         }
       }
 
@@ -262,6 +262,7 @@ export class KeyServiceMac {
   ): Promise<string> {
     const helperPath = this.getHelperPath()
     const waitMs = Math.max(timeoutMs, 30_000)
+    const timeoutSec = Math.ceil(waitMs / 1000) + 30
     const pid = await this.getWeChatPid()
     onStatus?.(`已找到微信进程 PID=${pid}，正在定位目标函数...`, 0)
     // 最佳努力清理同路径残留 helper（普通权限）
@@ -378,12 +379,22 @@ export class KeyServiceMac {
   ): Promise<string> {
     const helperPath = this.getHelperPath()
     const waitMs = Math.max(timeoutMs, 30_000)
+    const timeoutSec = Math.ceil(waitMs / 1000) + 30
     const pid = await this.getWeChatPid()
     // 用 AppleScript 的 quoted form 组装命令，避免复杂 shell 拼接导致整条失败
+    // 通过 try/on error 回传详细错误，避免只看到 "Command failed"
     const scriptLines = [
       `set helperPath to ${JSON.stringify(helperPath)}`,
-      `set cmd to quoted form of helperPath & " ${pid} ${waitMs} 2>&1"`,
-      'do shell script cmd with administrator privileges'
+      `set cmd to quoted form of helperPath & " ${pid} ${waitMs}"`,
+      `set timeoutSec to ${timeoutSec}`,
+      'try',
+      'with timeout of timeoutSec seconds',
+      'set outText to do shell script cmd with administrator privileges',
+      'end timeout',
+      'return "WF_OK::" & outText',
+      'on error errMsg number errNum partial result pr',
+      'return "WF_ERR::" & errNum & "::" & errMsg & "::" & (pr as text)',
+      'end try'
     ]
     onStatus?.('已准备就绪，现在登录微信或退出登录后重新登录微信', 0)
 
@@ -400,6 +411,16 @@ export class KeyServiceMac {
 
     const lines = String(stdout).split(/\r?\n/).map(x => x.trim()).filter(Boolean)
     if (!lines.length) throw new Error('elevated helper returned empty output')
+    const joined = lines.join('\n')
+
+    if (joined.startsWith('WF_ERR::')) {
+      const parts = joined.split('::')
+      const errNum = parts[1] || 'unknown'
+      const errMsg = parts[2] || 'unknown'
+      const partial = parts.slice(3).join('::')
+      throw new Error(`elevated helper failed: errNum=${errNum}, errMsg=${errMsg}, partial=${partial || '(empty)'}`)
+    }
+    const normalizedOutput = joined.startsWith('WF_OK::') ? joined.slice('WF_OK::'.length) : joined
 
     // 从所有行里提取所有 JSON 对象（同一行可能有多个拼接），找含 key/result 的那个
     const extractJsonObjects = (s: string): any[] => {
@@ -411,7 +432,7 @@ export class KeyServiceMac {
       }
       return results
     }
-    const fullOutput = lines.join('\n')
+    const fullOutput = normalizedOutput
     const allJson = extractJsonObjects(fullOutput)
     // 优先找 success=true && key 字段
     const successPayload = allJson.find(p => p?.success === true && typeof p?.key === 'string')
