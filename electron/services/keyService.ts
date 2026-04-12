@@ -61,6 +61,7 @@ export class KeyService {
 
   private getDllPath(): string {
     const isPackaged = typeof app !== 'undefined' && app ? app.isPackaged : process.env.NODE_ENV === 'production'
+    const archDir = process.arch === 'arm64' ? 'arm64' : 'x64'
     const candidates: string[] = []
 
     if (process.env.WX_KEY_DLL_PATH) {
@@ -68,11 +69,20 @@ export class KeyService {
     }
 
     if (isPackaged) {
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(process.resourcesPath, 'resources', 'wx_key.dll'))
       candidates.push(join(process.resourcesPath, 'wx_key.dll'))
     } else {
       const cwd = process.cwd()
+      candidates.push(join(cwd, 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(cwd, 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(cwd, 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(cwd, 'resources', 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', archDir, 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', 'x64', 'wx_key.dll'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'win32', 'wx_key.dll'))
       candidates.push(join(app.getAppPath(), 'resources', 'wx_key.dll'))
     }
 
@@ -684,10 +694,7 @@ export class KeyService {
     return { success: false, error: '获取密钥超时', logs }
   }
 
-  // --- Image Key (通过 DLL 从缓存目录获取 code，用前端 wxid 计算密钥) ---
-
   private cleanWxid(wxid: string): string {
-    // 截断到第二个下划线: wxid_g4pshorcc0r529_da6c → wxid_g4pshorcc0r529
     const first = wxid.indexOf('_')
     if (first === -1) return wxid
     const second = wxid.indexOf('_', first + 1)

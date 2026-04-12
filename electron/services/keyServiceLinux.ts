@@ -17,21 +17,31 @@ export class KeyServiceLinux {
 
   constructor() {
     try {
-      this.sudo = require('sudo-prompt');
+      this.sudo = require('@vscode/sudo-prompt');
     } catch (e) {
-      console.error('Failed to load sudo-prompt', e);
+      console.error('Failed to load @vscode/sudo-prompt', e);
     }
   }
 
   private getHelperPath(): string {
     const isPackaged = app.isPackaged
+    const archDir = process.arch === 'arm64' ? 'arm64' : 'x64'
     const candidates: string[] = []
     if (process.env.WX_KEY_HELPER_PATH) candidates.push(process.env.WX_KEY_HELPER_PATH)
     if (isPackaged) {
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'linux', archDir, 'xkey_helper_linux'))
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'linux', 'x64', 'xkey_helper_linux'))
+      candidates.push(join(process.resourcesPath, 'resources', 'key', 'linux', 'xkey_helper_linux'))
       candidates.push(join(process.resourcesPath, 'resources', 'xkey_helper_linux'))
       candidates.push(join(process.resourcesPath, 'xkey_helper_linux'))
     } else {
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'linux', archDir, 'xkey_helper_linux'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'linux', 'x64', 'xkey_helper_linux'))
+      candidates.push(join(app.getAppPath(), 'resources', 'key', 'linux', 'xkey_helper_linux'))
       candidates.push(join(app.getAppPath(), 'resources', 'xkey_helper_linux'))
+      candidates.push(join(process.cwd(), 'resources', 'key', 'linux', archDir, 'xkey_helper_linux'))
+      candidates.push(join(process.cwd(), 'resources', 'key', 'linux', 'x64', 'xkey_helper_linux'))
+      candidates.push(join(process.cwd(), 'resources', 'key', 'linux', 'xkey_helper_linux'))
       candidates.push(join(app.getAppPath(), '..', 'Xkey', 'build', 'xkey_helper_linux'))
     }
     for (const p of candidates) {
@@ -88,7 +98,12 @@ export class KeyServiceLinux {
         'xwechat',
         '/opt/wechat/wechat',
         '/usr/bin/wechat',
-        '/opt/apps/com.tencent.wechat/files/wechat'
+        '/usr/local/bin/wechat',
+        '/usr/bin/wechat',
+        '/opt/apps/com.tencent.wechat/files/wechat',
+        '/usr/bin/wechat-bin',
+        '/usr/local/bin/wechat-bin',
+        'com.tencent.wechat'
       ]
 
       for (const binName of wechatBins) {
@@ -142,7 +157,7 @@ export class KeyServiceLinux {
       }
 
       if (!pid) {
-        const err = '未能自动启动微信，或获取PID失败，请查看控制台日志或手动启动并登录。'
+        const err = '未能自动启动微信，或获取PID失败，请查看控制台日志或手动启动微信，看到登录窗口后点击确认。'
         onStatus?.(err, 2)
         return { success: false, error: err }
       }

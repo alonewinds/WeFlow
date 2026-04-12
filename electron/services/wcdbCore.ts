@@ -1,8 +1,9 @@
-﻿import { join, dirname, basename } from 'path'
+import { join, dirname, basename } from 'path'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
+import * as fzstd from 'fzstd'
 
-// DLL 初始化错误信息，用于帮助用户诊断问题
+//数据服务初始化错误信息，用于帮助用户诊断问题
 let lastDllInitError: string | null = null
 
 export function getLastDllInitError(): string | null {
@@ -57,6 +58,7 @@ export class WcdbCore {
   private wcdbGetAnnualReportExtras: any = null
   private wcdbGetDualReportStats: any = null
   private wcdbGetGroupStats: any = null
+  private wcdbGetMyFootprintStats: any = null
   private wcdbGetMessageDates: any = null
   private wcdbOpenMessageCursor: any = null
   private wcdbOpenMessageCursorLite: any = null
@@ -80,6 +82,7 @@ export class WcdbCore {
   private wcdbGetSessionMessageDateCounts: any = null
   private wcdbGetSessionMessageDateCountsBatch: any = null
   private wcdbGetMessagesByType: any = null
+  private wcdbScanMediaStream: any = null
   private wcdbGetHeadImageBuffers: any = null
   private wcdbSearchMessages: any = null
   private wcdbGetSnsTimeline: any = null
@@ -92,6 +95,9 @@ export class WcdbCore {
   private wcdbResolveImageHardlinkBatch: any = null
   private wcdbResolveVideoHardlinkMd5: any = null
   private wcdbResolveVideoHardlinkMd5Batch: any = null
+  private wcdbInstallMessageAntiRevokeTrigger: any = null
+  private wcdbUninstallMessageAntiRevokeTrigger: any = null
+  private wcdbCheckMessageAntiRevokeTrigger: any = null
   private wcdbInstallSnsBlockDeleteTrigger: any = null
   private wcdbUninstallSnsBlockDeleteTrigger: any = null
   private wcdbCheckSnsBlockDeleteTrigger: any = null
@@ -116,9 +122,14 @@ export class WcdbCore {
   private videoHardlinkCache: Map<string, { result: { success: boolean; data?: any; error?: string }; updatedAt: number }> = new Map()
   private readonly hardlinkCacheTtlMs = 10 * 60 * 1000
   private readonly hardlinkCacheMaxEntries = 20000
+  private mediaStreamSessionCache: Array<{ sessionId: string; displayName: string; sortTimestamp: number }> | null = null
+  private mediaStreamSessionCacheAt = 0
+  private readonly mediaStreamSessionCacheTtlMs = 12 * 1000
   private logTimer: NodeJS.Timeout | null = null
   private lastLogTail: string | null = null
   private lastResolvedLogPath: string | null = null
+  private lastCursorForceReopenAt = 0
+  private readonly cursorForceReopenCooldownMs = 15000
 
   setPaths(resourcesPath: string, userDataPath: string): void {
     this.resourcesPath = resourcesPath
@@ -154,7 +165,7 @@ export class WcdbCore {
         return false
       }
 
-      // 从 DLL 获取动态管道名（含 PID）
+      // 从数据服务获取动态管道名（含 PID）
       let pipePath = '\\\\.\\pipe\\weflow_monitor'
       if (this.wcdbGetMonitorPipeName) {
         try {
@@ -163,7 +174,7 @@ export class WcdbCore {
             pipePath = this.koffi.decode(namePtr[0], 'char', -1)
             this.wcdbFreeString(namePtr[0])
           }
-        } catch {}
+        } catch { }
       }
       this.connectMonitorPipe(pipePath)
       return true
@@ -181,7 +192,7 @@ export class WcdbCore {
     setTimeout(() => {
       if (!this.monitorCallback) return
 
-      this.monitorPipeClient = net.createConnection(this.monitorPipePath, () => {})
+      this.monitorPipeClient = net.createConnection(this.monitorPipePath, () => { })
 
       let buffer = ''
       this.monitorPipeClient.on('data', (data: Buffer) => {
@@ -272,8 +283,10 @@ export class WcdbCore {
     const isLinux = process.platform === 'linux'
     const isArm64 = process.arch === 'arm64'
     const libName = isMac ? 'libwcdb_api.dylib' : isLinux ? 'libwcdb_api.so' : 'wcdb_api.dll'
-    const subDir = isMac ? 'macos' : isLinux ? 'linux' : (isArm64 ? 'arm64' : '')
-    
+    const legacySubDir = isMac ? 'macos' : isLinux ? 'linux' : (isArm64 ? 'arm64' : '')
+    const platformDir = isMac ? 'macos' : (isLinux ? 'linux' : 'win32')
+    const archDir = isMac ? 'universal' : (isArm64 ? 'arm64' : 'x64')
+
     const envDllPath = process.env.WCDB_DLL_PATH
     if (envDllPath && envDllPath.length > 0) {
       return envDllPath
@@ -282,19 +295,32 @@ export class WcdbCore {
     // 基础路径探测
     const isPackaged = typeof process['resourcesPath'] !== 'undefined'
     const resourcesPath = isPackaged ? process.resourcesPath : join(process.cwd(), 'resources')
-
-    const candidates = [
-      // 环境变量指定 resource 目录
-      process.env.WCDB_RESOURCES_PATH ? join(process.env.WCDB_RESOURCES_PATH, subDir, libName) : null,
-      // 显式 setPaths 设置的路径
-      this.resourcesPath ? join(this.resourcesPath, subDir, libName) : null,
-      // resources/macos/libwcdb_api.dylib 或 resources/wcdb_api.dll
-      join(resourcesPath, 'resources', subDir, libName),
-      // resources/libwcdb_api.dylib 或 resources/wcdb_api.dll (扁平结构)
-      join(resourcesPath, subDir, libName),
-      // CWD fallback
-      join(process.cwd(), 'resources', subDir, libName)
+    const roots = [
+      process.env.WCDB_RESOURCES_PATH || null,
+      this.resourcesPath || null,
+      join(resourcesPath, 'resources'),
+      resourcesPath,
+      join(process.cwd(), 'resources')
     ].filter(Boolean) as string[]
+
+    const normalizedArch = process.arch === 'arm64' ? 'arm64' : 'x64'
+    const relativeCandidates = [
+      join('wcdb', platformDir, archDir, libName),
+      join('wcdb', platformDir, normalizedArch, libName),
+      join('wcdb', platformDir, 'x64', libName),
+      join('wcdb', platformDir, 'universal', libName),
+      join('wcdb', platformDir, libName)
+    ]
+
+    const candidates: string[] = []
+    for (const root of roots) {
+      for (const relativePath of relativeCandidates) {
+        candidates.push(join(root, relativePath))
+      }
+      // 兼容旧目录：resources/macos/libwcdb_api.dylib 或 resources/wcdb_api.dll
+      candidates.push(join(root, legacySubDir, libName))
+      candidates.push(join(root, libName))
+    }
 
     for (const path of candidates) {
       if (existsSync(path)) return path
@@ -304,7 +330,17 @@ export class WcdbCore {
   }
 
   private formatInitProtectionError(code: number): string {
-    return `错误码: ${code}`
+    const messages: Record<number, string> = {
+      '-3001': '未找到数据库目录 (db_storage)，请确认已选择正确的微信数据目录（应包含以 wxid_ 开头的子文件夹）',
+      '-3002': '未找到 session.db 文件，请确认微信已登录并且数据目录完整',
+      '-3003': '数据库句柄无效，请重试',
+      '-3004': '恢复数据库连接失败，请重试',
+      '-2301': '动态库加载失败，请检查安装是否完整',
+      '-2302': 'WCDB 初始化异常，请重试',
+      '-2303': 'WCDB 未能成功初始化',
+    }
+    const msg = messages[String(code) as unknown as keyof typeof messages]
+    return msg ? `${msg} (错误码: ${code})` : `操作失败，错误码: ${code}`
   }
 
   private isLogEnabled(): boolean {
@@ -480,6 +516,49 @@ export class WcdbCore {
         }
       } catch { }
     }
+    // 兜底：向上查找 db_storage（最多 2 级），处理用户选择了子目录的情况
+    try {
+      let parent = normalized
+      for (let i = 0; i < 2; i++) {
+        const up = join(parent, '..')
+        if (up === parent) break
+        parent = up
+        const candidateUp = join(parent, 'db_storage')
+        if (existsSync(candidateUp)) return candidateUp
+        if (wxid) {
+          const viaWxidUp = join(parent, wxid, 'db_storage')
+          if (existsSync(viaWxidUp)) return viaWxidUp
+        }
+      }
+    } catch { }
+    // 兜底：递归搜索 basePath 下的 db_storage 目录（最多 3 层深）
+    try {
+      const found = this.findDbStorageRecursive(normalized, 3)
+      if (found) return found
+    } catch { }
+    return null
+  }
+
+  private findDbStorageRecursive(dir: string, maxDepth: number): string | null {
+    if (maxDepth <= 0) return null
+    try {
+      const entries = readdirSync(dir)
+      for (const entry of entries) {
+        if (entry.toLowerCase() === 'db_storage') {
+          const candidate = join(dir, entry)
+          try { if (statSync(candidate).isDirectory()) return candidate } catch { }
+        }
+      }
+      for (const entry of entries) {
+        const entryPath = join(dir, entry)
+        try {
+          if (statSync(entryPath).isDirectory()) {
+            const found = this.findDbStorageRecursive(entryPath, maxDepth - 1)
+            if (found) return found
+          }
+        } catch { }
+      }
+    } catch { }
     return null
   }
 
@@ -582,15 +661,15 @@ export class WcdbCore {
       this.writeLog(`[bootstrap] initialize platform=${process.platform} dllPath=${dllPath} resourcesPath=${this.resourcesPath || ''} userDataPath=${this.userDataPath || ''}`, true)
 
       if (!existsSync(dllPath)) {
-        console.error('WCDB DLL 不存在:', dllPath)
-        this.writeLog(`[bootstrap] initialize failed: dll not found path=${dllPath}`, true)
+        console.error('WCDB数据服务不存在:', dllPath)
+        this.writeLog(`[bootstrap] initialize failed:数据服务not found path=${dllPath}`, true)
         return false
       }
 
       const dllDir = dirname(dllPath)
       const isMac = process.platform === 'darwin'
       const isLinux = process.platform === 'linux'
-      
+
       // 预加载依赖库
       if (isMac) {
         const wcdbCorePath = join(dllDir, 'libWCDB.dylib')
@@ -638,7 +717,7 @@ export class WcdbCore {
 
         // 尝试多个可能的资源路径
         const resourcePaths = [
-          dllDir,  // DLL 所在目录
+          dllDir,  //数据服务所在目录
           dirname(dllDir),  // 上级目录
           process.resourcesPath,  // 打包后 Contents/Resources
           process.resourcesPath ? join(process.resourcesPath as string, 'resources') : null,  // Contents/Resources/resources
@@ -847,6 +926,13 @@ export class WcdbCore {
         this.wcdbGetGroupStats = null
       }
 
+      // wcdb_status wcdb_get_my_footprint_stats(wcdb_handle handle, const char* options_json, char** out_json)
+      try {
+        this.wcdbGetMyFootprintStats = this.lib.func('int32 wcdb_get_my_footprint_stats(int64 handle, const char* optionsJson, _Out_ void** outJson)')
+      } catch {
+        this.wcdbGetMyFootprintStats = null
+      }
+
       // wcdb_status wcdb_get_message_dates(wcdb_handle handle, const char* session_id, char** out_json)
       try {
         this.wcdbGetMessageDates = this.lib.func('int32 wcdb_get_message_dates(int64 handle, const char* sessionId, _Out_ void** outJson)')
@@ -958,6 +1044,11 @@ export class WcdbCore {
         this.wcdbGetMessagesByType = null
       }
       try {
+        this.wcdbScanMediaStream = this.lib.func('int32 wcdb_scan_media_stream(int64 handle, const char* sessionIdsJson, int32 mediaType, int32 beginTimestamp, int32 endTimestamp, int32 limit, int32 offset, _Out_ void** outJson, _Out_ int32* outHasMore)')
+      } catch {
+        this.wcdbScanMediaStream = null
+      }
+      try {
         this.wcdbGetHeadImageBuffers = this.lib.func('int32 wcdb_get_head_image_buffers(int64 handle, const char* usernamesJson, _Out_ void** outJson)')
       } catch {
         this.wcdbGetHeadImageBuffers = null
@@ -1022,6 +1113,27 @@ export class WcdbCore {
         this.wcdbResolveVideoHardlinkMd5Batch = this.lib.func('int32 wcdb_resolve_video_hardlink_md5_batch(int64 handle, const char* requestsJson, _Out_ void** outJson)')
       } catch {
         this.wcdbResolveVideoHardlinkMd5Batch = null
+      }
+
+      // wcdb_status wcdb_install_message_anti_revoke_trigger(wcdb_handle handle, const char* session_id, char** out_error)
+      try {
+        this.wcdbInstallMessageAntiRevokeTrigger = this.lib.func('int32 wcdb_install_message_anti_revoke_trigger(int64 handle, const char* sessionId, _Out_ void** outError)')
+      } catch {
+        this.wcdbInstallMessageAntiRevokeTrigger = null
+      }
+
+      // wcdb_status wcdb_uninstall_message_anti_revoke_trigger(wcdb_handle handle, const char* session_id, char** out_error)
+      try {
+        this.wcdbUninstallMessageAntiRevokeTrigger = this.lib.func('int32 wcdb_uninstall_message_anti_revoke_trigger(int64 handle, const char* sessionId, _Out_ void** outError)')
+      } catch {
+        this.wcdbUninstallMessageAntiRevokeTrigger = null
+      }
+
+      // wcdb_status wcdb_check_message_anti_revoke_trigger(wcdb_handle handle, const char* session_id, int32_t* out_installed)
+      try {
+        this.wcdbCheckMessageAntiRevokeTrigger = this.lib.func('int32 wcdb_check_message_anti_revoke_trigger(int64 handle, const char* sessionId, _Out_ int32* outInstalled)')
+      } catch {
+        this.wcdbCheckMessageAntiRevokeTrigger = null
       }
 
       // wcdb_status wcdb_install_sns_block_delete_trigger(wcdb_handle handle, char** out_error)
@@ -1203,7 +1315,7 @@ export class WcdbCore {
   }
 
   /**
-   * 打印 DLL 内部日志（仅在出错时调用）
+   * 打印数据服务内部日志（仅在出错时调用）
    */
   private async printLogs(force = false): Promise<void> {
     try {
@@ -1284,12 +1396,12 @@ export class WcdbCore {
     const raw = String(jsonStr || '')
     if (!raw) return []
     // 热路径优化：仅在检测到 16+ 位整数字段时才进行字符串包裹，避免每批次多轮全量 replace。
-    const needsInt64Normalize = /"(?:server_id|serverId|ServerId|msg_server_id|msgServerId|MsgServerId)"\s*:\s*-?\d{16,}/.test(raw)
+    const needsInt64Normalize = /"server_id"\s*:\s*-?\d{16,}/.test(raw)
     if (!needsInt64Normalize) {
       return JSON.parse(raw)
     }
     const normalized = raw.replace(
-      /("(?:server_id|serverId|ServerId|msg_server_id|msgServerId|MsgServerId)"\s*:\s*)(-?\d{16,})/g,
+      /("server_id"\s*:\s*)(-?\d{16,})/g,
       '$1"$2"'
     )
     return JSON.parse(normalized)
@@ -1379,6 +1491,11 @@ export class WcdbCore {
   private clearHardlinkCaches(): void {
     this.imageHardlinkCache.clear()
     this.videoHardlinkCache.clear()
+  }
+
+  private clearMediaStreamSessionCache(): void {
+    this.mediaStreamSessionCache = null
+    this.mediaStreamSessionCacheAt = 0
   }
 
   isReady(): boolean {
@@ -1496,6 +1613,7 @@ export class WcdbCore {
       this.currentDbStoragePath = null
       this.initialized = false
       this.clearHardlinkCaches()
+      this.clearMediaStreamSessionCache()
       this.stopLogPolling()
     }
   }
@@ -1526,7 +1644,7 @@ export class WcdbCore {
       const outPtr = [null as any]
       const result = this.wcdbGetSessions(this.handle, outPtr)
 
-      // DLL 调用后再次让出控制权
+      //数据服务调用后再次让出控制权
       await new Promise(resolve => setImmediate(resolve))
 
       if (result !== 0 || !outPtr[0]) {
@@ -1602,6 +1720,9 @@ export class WcdbCore {
       const outCount = [0]
       const result = this.wcdbGetMessageCount(this.handle, sessionId, outCount)
       if (result !== 0) {
+        if (result === -7) {
+          return { success: false, error: 'message schema mismatch：当前账号消息表结构与程序要求不一致' }
+        }
         return { success: false, error: `获取消息总数失败: ${result}` }
       }
       return { success: true, count: outCount[0] }
@@ -1632,6 +1753,9 @@ export class WcdbCore {
         const sessionId = normalizedSessionIds[i]
         const outCount = [0]
         const result = this.wcdbGetMessageCount(this.handle, sessionId, outCount)
+        if (result === -7) {
+          return { success: false, error: `message schema mismatch：会话 ${sessionId} 的消息表结构不匹配` }
+        }
         counts[sessionId] = result === 0 && Number.isFinite(outCount[0]) ? Math.max(0, Math.floor(outCount[0])) : 0
 
         if (i > 0 && i % 160 === 0) {
@@ -1651,6 +1775,9 @@ export class WcdbCore {
       const outPtr = [null as any]
       const result = this.wcdbGetSessionMessageCounts(this.handle, JSON.stringify(sessionIds || []), outPtr)
       if (result !== 0 || !outPtr[0]) {
+        if (result === -7) {
+          return { success: false, error: 'message schema mismatch：当前账号消息表结构与程序要求不一致' }
+        }
         return { success: false, error: `获取会话消息总数失败: ${result}` }
       }
       const jsonStr = this.decodeJsonPtr(outPtr[0])
@@ -1835,6 +1962,444 @@ export class WcdbCore {
     }
   }
 
+  async getMediaStream(options?: {
+    sessionId?: string
+    mediaType?: 'image' | 'video' | 'all'
+    beginTimestamp?: number
+    endTimestamp?: number
+    limit?: number
+    offset?: number
+  }): Promise<{
+    success: boolean
+    items?: Array<{
+      sessionId: string
+      sessionDisplayName?: string
+      mediaType: 'image' | 'video'
+      localId: number
+      serverId?: string
+      createTime: number
+      localType: number
+      senderUsername?: string
+      isSend?: number | null
+      imageMd5?: string
+      imageDatName?: string
+      videoMd5?: string
+      content?: string
+    }>
+    hasMore?: boolean
+    nextOffset?: number
+    error?: string
+  }> {
+    if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    if (!this.wcdbScanMediaStream) return { success: false, error: '当前数据服务版本不支持资源扫描，请先更新 wcdb 数据服务' }
+    try {
+      const toInt = (value: unknown): number => {
+        const n = Number(value || 0)
+        if (!Number.isFinite(n)) return 0
+        return Math.floor(n)
+      }
+      const pickString = (row: Record<string, any>, keys: string[]): string => {
+        for (const key of keys) {
+          const value = row[key]
+          if (value === null || value === undefined) continue
+          const text = String(value).trim()
+          if (text) return text
+        }
+        return ''
+      }
+      const extractXmlValue = (xml: string, tag: string): string => {
+        if (!xml) return ''
+        const regex = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i')
+        const match = regex.exec(xml)
+        if (!match) return ''
+        return String(match[1] || '').replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim()
+      }
+      const looksLikeHex = (text: string): boolean => {
+        if (!text || text.length < 2 || text.length % 2 !== 0) return false
+        return /^[0-9a-fA-F]+$/.test(text)
+      }
+      const looksLikeBase64 = (text: string): boolean => {
+        if (!text || text.length < 16 || text.length % 4 !== 0) return false
+        return /^[A-Za-z0-9+/]+={0,2}$/.test(text)
+      }
+      const decodeBinaryContent = (data: Buffer, fallbackValue?: string): string => {
+        if (!data || data.length === 0) return ''
+        try {
+          if (data.length >= 4) {
+            const magicLE = data.readUInt32LE(0)
+            const magicBE = data.readUInt32BE(0)
+            if (magicLE === 0xFD2FB528 || magicBE === 0xFD2FB528) {
+              try {
+                const decompressed = fzstd.decompress(data)
+                return Buffer.from(decompressed).toString('utf-8')
+              } catch {
+                // ignore
+              }
+            }
+          }
+          const decoded = data.toString('utf-8')
+          const replacementCount = (decoded.match(/\uFFFD/g) || []).length
+          if (replacementCount < decoded.length * 0.2) {
+            return decoded.replace(/\uFFFD/g, '')
+          }
+          if (fallbackValue && replacementCount > 0) return fallbackValue
+          return data.toString('latin1')
+        } catch {
+          return fallbackValue || ''
+        }
+      }
+      const decodeMaybeCompressed = (raw: unknown): string => {
+        if (raw === null || raw === undefined) return ''
+        if (Buffer.isBuffer(raw) || raw instanceof Uint8Array) {
+          return decodeBinaryContent(Buffer.from(raw as any), String(raw))
+        }
+        const text = String(raw).trim()
+        if (!text) return ''
+
+        if (text.length > 16 && looksLikeHex(text)) {
+          try {
+            const bytes = Buffer.from(text, 'hex')
+            if (bytes.length > 0) return decodeBinaryContent(bytes, text)
+          } catch {
+            // ignore
+          }
+        }
+        if (text.length > 16 && looksLikeBase64(text)) {
+          try {
+            const bytes = Buffer.from(text, 'base64')
+            if (bytes.length > 0) return decodeBinaryContent(bytes, text)
+          } catch {
+            // ignore
+          }
+        }
+        return text
+      }
+      const decodeMessageContent = (messageContent: unknown, compressContent: unknown): string => {
+        const compressedDecoded = decodeMaybeCompressed(compressContent)
+        if (compressedDecoded) return compressedDecoded
+        return decodeMaybeCompressed(messageContent)
+      }
+      const extractImageMd5 = (xml: string): string => {
+        const byTag = extractXmlValue(xml, 'md5') || extractXmlValue(xml, 'imgmd5')
+        if (byTag) return byTag
+        const byAttr = /(?:md5|imgmd5)\s*=\s*['"]?([a-fA-F0-9]{16,64})['"]?/i.exec(xml)
+        return byAttr?.[1] || ''
+      }
+      const normalizeDatBase = (value: string): string => {
+        const input = String(value || '').trim()
+        if (!input) return ''
+        const fileBase = input.replace(/^.*[\\/]/, '').replace(/\.(?:t\.)?dat$/i, '')
+        const md5Like = /([0-9a-fA-F]{16,64})/.exec(fileBase)
+        return String(md5Like?.[1] || fileBase || '').trim().toLowerCase()
+      }
+      const decodePackedToPrintable = (raw: string): string => {
+        const text = String(raw || '').trim()
+        if (!text) return ''
+        let buf: Buffer | null = null
+        if (/^[a-fA-F0-9]+$/.test(text) && text.length % 2 === 0) {
+          try {
+            buf = Buffer.from(text, 'hex')
+          } catch {
+            buf = null
+          }
+        }
+        if (!buf) {
+          try {
+            const base64 = Buffer.from(text, 'base64')
+            if (base64.length > 0) buf = base64
+          } catch {
+            buf = null
+          }
+        }
+        if (!buf || buf.length === 0) return ''
+        const printable: number[] = []
+        for (const byte of buf) {
+          if (byte >= 0x20 && byte <= 0x7e) printable.push(byte)
+          else printable.push(0x20)
+        }
+        return Buffer.from(printable).toString('utf-8')
+      }
+      const extractHexMd5 = (text: string): string => {
+        const input = String(text || '')
+        if (!input) return ''
+        const match = /([a-fA-F0-9]{32})/.exec(input)
+        return String(match?.[1] || '').toLowerCase()
+      }
+      const extractImageDatName = (row: Record<string, any>, content: string): string => {
+        const direct = pickString(row, [
+          'image_path',
+          'imagePath',
+          'image_dat_name',
+          'imageDatName',
+          'img_path',
+          'imgPath',
+          'img_name',
+          'imgName'
+        ])
+        const normalizedDirect = normalizeDatBase(direct)
+        if (normalizedDirect) return normalizedDirect
+
+        const xmlCandidate = extractXmlValue(content, 'imgname') || extractXmlValue(content, 'cdnmidimgurl')
+        const normalizedXml = normalizeDatBase(xmlCandidate)
+        if (normalizedXml) return normalizedXml
+
+        const packedRaw = pickString(row, [
+          'packed_info_data',
+          'packedInfoData',
+          'packed_info_blob',
+          'packedInfoBlob',
+          'packed_info',
+          'packedInfo',
+          'BytesExtra',
+          'bytes_extra',
+          'WCDB_CT_packed_info',
+          'reserved0',
+          'Reserved0',
+          'WCDB_CT_Reserved0'
+        ])
+        const packedText = decodePackedToPrintable(packedRaw)
+        if (packedText) {
+          const datLike = /([0-9a-fA-F]{8,})(?:\.t)?\.dat/i.exec(packedText)
+          if (datLike?.[1]) return String(datLike[1]).toLowerCase()
+          const md5Like = /([0-9a-fA-F]{16,64})/.exec(packedText)
+          if (md5Like?.[1]) return String(md5Like[1]).toLowerCase()
+        }
+
+        return ''
+      }
+      const extractPackedPayload = (row: Record<string, any>): string => {
+        const packedRaw = pickString(row, [
+          'packed_info_data',
+          'packedInfoData',
+          'packed_info_blob',
+          'packedInfoBlob',
+          'packed_info',
+          'packedInfo',
+          'BytesExtra',
+          'bytes_extra',
+          'WCDB_CT_packed_info',
+          'reserved0',
+          'Reserved0',
+          'WCDB_CT_Reserved0'
+        ])
+        return decodePackedToPrintable(packedRaw)
+      }
+      const extractVideoMd5 = (xml: string): string => {
+        const byTag =
+          extractXmlValue(xml, 'rawmd5') ||
+          extractXmlValue(xml, 'videomd5') ||
+          extractXmlValue(xml, 'newmd5') ||
+          extractXmlValue(xml, 'md5')
+        if (byTag) return byTag
+        const byAttr = /(?:rawmd5|videomd5|newmd5|md5)\s*=\s*['"]?([a-fA-F0-9]{16,64})['"]?/i.exec(xml)
+        return byAttr?.[1] || ''
+      }
+
+      const requestedSessionId = String(options?.sessionId || '').trim()
+      const mediaType = String(options?.mediaType || 'all').trim() as 'image' | 'video' | 'all'
+      const beginTimestamp = Math.max(0, toInt(options?.beginTimestamp))
+      const endTimestamp = Math.max(0, toInt(options?.endTimestamp))
+      const offset = Math.max(0, toInt(options?.offset))
+      const limit = Math.min(1200, Math.max(40, toInt(options?.limit) || 240))
+
+      const getSessionRows = async (): Promise<{
+        success: boolean
+        rows?: Array<{ sessionId: string; displayName: string; sortTimestamp: number }>
+        error?: string
+      }> => {
+        const now = Date.now()
+        const cachedRows = this.mediaStreamSessionCache
+        if (
+          cachedRows &&
+          now - this.mediaStreamSessionCacheAt <= this.mediaStreamSessionCacheTtlMs
+        ) {
+          return { success: true, rows: cachedRows }
+        }
+
+        const sessionsRes = await this.getSessions()
+        if (!sessionsRes.success || !Array.isArray(sessionsRes.sessions)) {
+          return { success: false, error: sessionsRes.error || '读取会话失败' }
+        }
+
+        const rows = (sessionsRes.sessions || [])
+          .map((row: any) => ({
+            sessionId: String(
+              row.username ||
+              row.user_name ||
+              row.userName ||
+              row.usrName ||
+              row.UsrName ||
+              row.talker ||
+              ''
+            ).trim(),
+            displayName: String(row.displayName || row.display_name || row.remark || '').trim(),
+            sortTimestamp: toInt(
+              row.sort_timestamp ||
+              row.sortTimestamp ||
+              row.last_timestamp ||
+              row.lastTimestamp ||
+              0
+            )
+          }))
+          .filter((row) => Boolean(row.sessionId))
+          .sort((a, b) => b.sortTimestamp - a.sortTimestamp)
+
+        this.mediaStreamSessionCache = rows
+        this.mediaStreamSessionCacheAt = now
+        return { success: true, rows }
+      }
+
+      let sessionRows: Array<{ sessionId: string; displayName: string; sortTimestamp: number }> = []
+      if (requestedSessionId) {
+        sessionRows = [{ sessionId: requestedSessionId, displayName: requestedSessionId, sortTimestamp: 0 }]
+      } else {
+        const sessionsRowsRes = await getSessionRows()
+        if (!sessionsRowsRes.success || !Array.isArray(sessionsRowsRes.rows)) {
+          return { success: false, error: sessionsRowsRes.error || '读取会话失败' }
+        }
+        sessionRows = sessionsRowsRes.rows
+      }
+
+      if (sessionRows.length === 0) {
+        return { success: true, items: [], hasMore: false, nextOffset: offset }
+      }
+      const sessionNameMap = new Map(sessionRows.map((row) => [row.sessionId, row.displayName || row.sessionId]))
+
+      const outPtr = [null as any]
+      const outHasMore = [0]
+      const mediaTypeCode = mediaType === 'image' ? 1 : mediaType === 'video' ? 2 : 0
+      const result = this.wcdbScanMediaStream(
+        this.handle,
+        JSON.stringify(sessionRows.map((row) => row.sessionId)),
+        mediaTypeCode,
+        beginTimestamp,
+        endTimestamp,
+        limit,
+        offset,
+        outPtr,
+        outHasMore
+      )
+      if (result !== 0 || !outPtr[0]) {
+        return { success: false, error: `扫描资源失败: ${result}` }
+      }
+      const jsonStr = this.decodeJsonPtr(outPtr[0])
+      if (!jsonStr) return { success: false, error: '解析资源失败' }
+      const rows = JSON.parse(jsonStr)
+      const list = Array.isArray(rows) ? rows as Array<Record<string, any>> : []
+
+      let items = list.map((row) => {
+        const sessionId = pickString(row, ['session_id', 'sessionId']) || requestedSessionId
+        const localType = toInt(row.local_type ?? row.localType)
+        const rawMessageContent = pickString(row, [
+          'message_content',
+          'messageContent',
+          'message_content_text',
+          'messageText',
+          'StrContent',
+          'str_content',
+          'msg_content',
+          'msgContent',
+          'strContent',
+          'content',
+          'rawContent',
+          'WCDB_CT_message_content'
+        ])
+        const rawCompressContent = pickString(row, [
+          'compress_content',
+          'compressContent',
+          'msg_compress_content',
+          'msgCompressContent',
+          'WCDB_CT_compress_content'
+        ])
+        const useRawMessageContent = Boolean(
+          rawMessageContent &&
+          (rawMessageContent.includes('<') || rawMessageContent.includes('md5') || rawMessageContent.includes('videomsg'))
+        )
+        const decodeContentIfNeeded = (): string => {
+          if (useRawMessageContent) return rawMessageContent
+          if (!rawMessageContent && !rawCompressContent) return ''
+          return decodeMessageContent(rawMessageContent, rawCompressContent)
+        }
+        const packedPayload = extractPackedPayload(row)
+        const imageMd5ByColumn = pickString(row, ['image_md5', 'imageMd5'])
+        const videoMd5ByColumn = pickString(row, ['video_md5', 'videoMd5', 'raw_md5', 'rawMd5'])
+
+        let content = ''
+        let imageMd5: string | undefined
+        let imageDatName: string | undefined
+        let videoMd5: string | undefined
+
+        if (localType === 3) {
+          imageMd5 = imageMd5ByColumn || extractHexMd5(packedPayload) || undefined
+          imageDatName = extractImageDatName(row, '') || undefined
+          if (!imageMd5 || !imageDatName) {
+            content = decodeContentIfNeeded()
+            if (!imageMd5) imageMd5 = extractImageMd5(content) || extractHexMd5(packedPayload) || undefined
+            if (!imageDatName) imageDatName = extractImageDatName(row, content) || undefined
+          }
+        } else if (localType === 43) {
+          videoMd5 = videoMd5ByColumn || extractHexMd5(packedPayload) || undefined
+          if (!videoMd5) {
+            content = decodeContentIfNeeded()
+            videoMd5 = extractVideoMd5(content) || extractHexMd5(packedPayload) || undefined
+          } else if (useRawMessageContent) {
+            // 占位态标题只依赖简单 XML，已带 md5 时不做额外解压
+            content = rawMessageContent
+          }
+        }
+
+        return {
+          sessionId,
+          sessionDisplayName: sessionNameMap.get(sessionId) || sessionId,
+          mediaType: localType === 43 ? 'video' as const : 'image' as const,
+          localId: toInt(row.local_id ?? row.localId),
+          serverId: pickString(row, ['server_id', 'serverId']) || undefined,
+          createTime: toInt(row.create_time ?? row.createTime),
+          localType,
+          senderUsername: pickString(row, ['sender_username', 'senderUsername']) || undefined,
+          isSend: row.is_send === null || row.is_send === undefined ? null : toInt(row.is_send),
+          imageMd5,
+          imageDatName,
+          videoMd5,
+          content: localType === 43 ? (content || undefined) : undefined
+        }
+      })
+
+      const unresolvedSessionIds = Array.from(
+        new Set(
+          items
+            .map((item) => item.sessionId)
+            .filter((sessionId) => {
+              const name = String(sessionNameMap.get(sessionId) || '').trim()
+              return !name || name === sessionId
+            })
+        )
+      )
+      if (unresolvedSessionIds.length > 0) {
+        const displayNameRes = await this.getDisplayNames(unresolvedSessionIds)
+        if (displayNameRes.success && displayNameRes.map) {
+          unresolvedSessionIds.forEach((sessionId) => {
+            const display = String(displayNameRes.map?.[sessionId] || '').trim()
+            if (display) sessionNameMap.set(sessionId, display)
+          })
+          items = items.map((item) => ({
+            ...item,
+            sessionDisplayName: sessionNameMap.get(item.sessionId) || item.sessionId
+          }))
+        }
+      }
+
+      return {
+        success: true,
+        items,
+        hasMore: Number(outHasMore[0]) > 0,
+        nextOffset: offset + items.length
+      }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
   async getDisplayNames(usernames: string[]): Promise<{ success: boolean; map?: Record<string, string>; error?: string }> {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
@@ -1872,7 +2437,7 @@ export class WcdbCore {
       const outPtr = [null as any]
       const result = this.wcdbGetDisplayNames(this.handle, JSON.stringify(usernames), outPtr)
 
-      // DLL 调用后再次让出控制权
+      //数据服务调用后再次让出控制权
       await new Promise(resolve => setImmediate(resolve))
 
       if (result !== 0 || !outPtr[0]) {
@@ -1957,7 +2522,7 @@ export class WcdbCore {
       const outPtr = [null as any]
       const result = this.wcdbGetAvatarUrls(handle, JSON.stringify(toFetch), outPtr)
 
-      // DLL 调用后再次让出控制权
+      //数据服务调用后再次让出控制权
       await new Promise(resolve => setImmediate(resolve))
 
       if (result !== 0 || !outPtr[0]) {
@@ -2057,7 +2622,7 @@ export class WcdbCore {
       return { success: false, error: 'WCDB 未连接' }
     }
     if (!this.wcdbGetGroupNicknames) {
-      return { success: false, error: '当前 DLL 版本不支持获取群昵称接口' }
+      return { success: false, error: '当前数据服务版本不支持获取群昵称接口' }
     }
     try {
       const outPtr = [null as any]
@@ -2543,13 +3108,102 @@ export class WcdbCore {
     }
   }
 
+  async getMyFootprintStats(options: {
+    beginTimestamp?: number
+    endTimestamp?: number
+    myWxid?: string
+    privateSessionIds?: string[]
+    groupSessionIds?: string[]
+    mentionLimit?: number
+    privateLimit?: number
+    mentionMode?: 'text_at_me' | string
+  }): Promise<{ success: boolean; data?: any; error?: string }> {
+    if (!this.ensureReady()) {
+      return { success: false, error: 'WCDB 未连接' }
+    }
+    if (!this.wcdbGetMyFootprintStats) {
+      return { success: false, error: '接口未就绪' }
+    }
+
+    try {
+      const normalizedPrivateSessions = Array.from(new Set(
+        (options?.privateSessionIds || [])
+          .map((value) => String(value || '').trim())
+          .filter(Boolean)
+      ))
+      const normalizedGroupSessions = Array.from(new Set(
+        (options?.groupSessionIds || [])
+          .map((value) => String(value || '').trim())
+          .filter(Boolean)
+      ))
+      const mentionLimitRaw = Number(options?.mentionLimit ?? 0)
+      const privateLimitRaw = Number(options?.privateLimit ?? 0)
+      const mentionLimit = Number.isFinite(mentionLimitRaw) && mentionLimitRaw >= 0 ? Math.floor(mentionLimitRaw) : 0
+      const privateLimit = Number.isFinite(privateLimitRaw) && privateLimitRaw >= 0 ? Math.floor(privateLimitRaw) : 0
+
+      const payload = JSON.stringify({
+        begin: this.normalizeTimestamp(options?.beginTimestamp || 0),
+        end: this.normalizeTimestamp(options?.endTimestamp || 0),
+        my_wxid: String(options?.myWxid || '').trim(),
+        private_session_ids: normalizedPrivateSessions,
+        group_session_ids: normalizedGroupSessions,
+        mention_limit: mentionLimit,
+        private_limit: privateLimit,
+        mention_mode: options?.mentionMode || 'text_at_me'
+      })
+
+      const outPtr = [null as any]
+      const result = this.wcdbGetMyFootprintStats(this.handle, payload, outPtr)
+      if (result !== 0 || !outPtr[0]) {
+        return { success: false, error: `获取我的足迹统计失败: ${result}` }
+      }
+      const jsonStr = this.decodeJsonPtr(outPtr[0])
+      if (!jsonStr) {
+        return { success: false, error: '解析我的足迹统计失败' }
+      }
+      return { success: true, data: JSON.parse(jsonStr) || {} }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /**
+   * 强制重新打开账号连接（绕过路径缓存），用于微信重装后消息数据库刷新失败时的自动恢复。
+   * 返回重新打开是否成功。
+   */
+  private async forceReopen(): Promise<boolean> {
+    if (!this.currentPath || !this.currentKey || !this.currentWxid) return false
+    const path = this.currentPath
+    const key = this.currentKey
+    const wxid = this.currentWxid
+    this.writeLog('forceReopen: clearing cached handle and reopening...', true)
+    // 清空缓存状态，让 open() 真正重新打开
+    try { this.wcdbShutdown() } catch { }
+    this.handle = null
+    this.currentPath = null
+    this.currentKey = null
+    this.currentWxid = null
+    this.currentDbStoragePath = null
+    this.initialized = false
+    return this.open(path, key, wxid)
+  }
+
+  private shouldRetryCursorAfterNoDb(): boolean {
+    const now = Date.now()
+    if (now - this.lastCursorForceReopenAt < this.cursorForceReopenCooldownMs) {
+      return false
+    }
+    this.lastCursorForceReopenAt = now
+    return true
+  }
+
   async openMessageCursor(sessionId: string, batchSize: number, ascending: boolean, beginTimestamp: number, endTimestamp: number): Promise<{ success: boolean; cursor?: number; error?: string }> {
     if (!this.ensureReady()) {
       return { success: false, error: 'WCDB 未连接' }
     }
     try {
       const outCursor = [0]
-      const result = this.wcdbOpenMessageCursor(
+      let result = this.wcdbOpenMessageCursor(
         this.handle,
         sessionId,
         batchSize,
@@ -2558,13 +3212,41 @@ export class WcdbCore {
         endTimestamp,
         outCursor
       )
+      // result=-3 表示 WCDB_STATUS_NO_MESSAGE_DB：消息数据库缓存为空（常见于微信重装后）
+      // 自动强制重连并重试一次
+      if (result === -3 && outCursor[0] <= 0 && this.shouldRetryCursorAfterNoDb()) {
+        this.writeLog('openMessageCursor: result=-3 (no message db), attempting forceReopen...', true)
+        const reopened = await this.forceReopen()
+        if (reopened && this.handle !== null) {
+          outCursor[0] = 0
+          result = this.wcdbOpenMessageCursor(
+            this.handle,
+            sessionId,
+            batchSize,
+            ascending ? 1 : 0,
+            beginTimestamp,
+            endTimestamp,
+            outCursor
+          )
+          this.writeLog(`openMessageCursor retry after forceReopen: result=${result} cursor=${outCursor[0]}`, true)
+        } else {
+          this.writeLog('openMessageCursor forceReopen failed, giving up', true)
+        }
+      }
       if (result !== 0 || outCursor[0] <= 0) {
-        await this.printLogs(true)
-        this.writeLog(
-          `openMessageCursor failed: sessionId=${sessionId} batchSize=${batchSize} ascending=${ascending ? 1 : 0} begin=${beginTimestamp} end=${endTimestamp} result=${result} cursor=${outCursor[0]}`,
-          true
-        )
-        return { success: false, error: `创建游标失败: ${result}，请查看日志` }
+        if (result !== -3) {
+          await this.printLogs(true)
+          this.writeLog(
+            `openMessageCursor failed: sessionId=${sessionId} batchSize=${batchSize} ascending=${ascending ? 1 : 0} begin=${beginTimestamp} end=${endTimestamp} result=${result} cursor=${outCursor[0]}`,
+            true
+          )
+        }
+        const hint = result === -3
+          ? `创建游标失败: ${result}（消息数据库未找到）。如果你最近重装过微信，请尝试重新指定数据目录后重试`
+          : result === -7
+            ? 'message schema mismatch：当前账号消息表结构与程序要求不一致'
+            : `创建游标失败: ${result}，请查看日志`
+        return { success: false, error: hint }
       }
       return { success: true, cursor: outCursor[0] }
     } catch (e) {
@@ -2583,7 +3265,7 @@ export class WcdbCore {
     }
     try {
       const outCursor = [0]
-      const result = this.wcdbOpenMessageCursorLite(
+      let result = this.wcdbOpenMessageCursorLite(
         this.handle,
         sessionId,
         batchSize,
@@ -2592,12 +3274,40 @@ export class WcdbCore {
         endTimestamp,
         outCursor
       )
+
+      // result=-3 表示 WCDB_STATUS_NO_MESSAGE_DB：消息数据库缓存为空
+      // 自动强制重连并重试一次
+      if (result === -3 && outCursor[0] <= 0 && this.shouldRetryCursorAfterNoDb()) {
+        this.writeLog('openMessageCursorLite: result=-3 (no message db), attempting forceReopen...', true)
+        const reopened = await this.forceReopen()
+        if (reopened && this.handle !== null) {
+          outCursor[0] = 0
+          result = this.wcdbOpenMessageCursorLite(
+            this.handle,
+            sessionId,
+            batchSize,
+            ascending ? 1 : 0,
+            beginTimestamp,
+            endTimestamp,
+            outCursor
+          )
+          this.writeLog(`openMessageCursorLite retry after forceReopen: result=${result} cursor=${outCursor[0]}`, true)
+        } else {
+          this.writeLog('openMessageCursorLite forceReopen failed, giving up', true)
+        }
+      }
+
       if (result !== 0 || outCursor[0] <= 0) {
-        await this.printLogs(true)
-        this.writeLog(
-          `openMessageCursorLite failed: sessionId=${sessionId} batchSize=${batchSize} ascending=${ascending ? 1 : 0} begin=${beginTimestamp} end=${endTimestamp} result=${result} cursor=${outCursor[0]}`,
-          true
-        )
+        if (result !== -3) {
+          await this.printLogs(true)
+          this.writeLog(
+            `openMessageCursorLite failed: sessionId=${sessionId} batchSize=${batchSize} ascending=${ascending ? 1 : 0} begin=${beginTimestamp} end=${endTimestamp} result=${result} cursor=${outCursor[0]}`,
+            true
+          )
+        }
+        if (result === -7) {
+          return { success: false, error: 'message schema mismatch：当前账号消息表结构与程序要求不一致' }
+        }
         return { success: false, error: `创建游标失败: ${result}，请查看日志` }
       }
       return { success: true, cursor: outCursor[0] }
@@ -2669,14 +3379,14 @@ export class WcdbCore {
       if (!this.wcdbExecQuery) return { success: false, error: '接口未就绪' }
       const fallbackFlag = /fallback|diag|diagnostic/i.test(String(sql || ''))
       this.writeLog(`[audit:execQuery] kind=${kind} path=${path || ''} sql_len=${String(sql || '').length} fallback=${fallbackFlag ? 1 : 0}`)
-      
+
       // 如果提供了参数，使用参数化查询（需要 C++ 层支持）
       // 注意：当前 wcdbExecQuery 可能不支持参数化，这是一个占位符实现
       // TODO: 需要更新 C++ 层的 wcdb_exec_query 以支持参数绑定
       if (params && params.length > 0) {
         console.warn('[wcdbCore] execQuery: 参数化查询暂未在 C++ 层实现，将使用原始 SQL（可能存在注入风险）')
       }
-      
+
       const normalizedKind = String(kind || '').toLowerCase()
       const isContactQuery = normalizedKind === 'contact' || /\bfrom\s+contact\b/i.test(String(sql))
       let effectivePath = path || ''
@@ -2827,7 +3537,7 @@ export class WcdbCore {
 
   async getVoiceData(sessionId: string, createTime: number, candidates: string[], localId: number = 0, svrId: string | number = 0): Promise<{ success: boolean; hex?: string; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbGetVoiceData) return { success: false, error: '当前 DLL 版本不支持获取语音数据' }
+    if (!this.wcdbGetVoiceData) return { success: false, error: '当前数据服务版本不支持获取语音数据' }
     try {
       const outPtr = [null as any]
       const result = this.wcdbGetVoiceData(this.handle, sessionId, createTime, localId, BigInt(svrId || 0), JSON.stringify(candidates), outPtr)
@@ -3241,7 +3951,7 @@ export class WcdbCore {
 
   async searchMessages(keyword: string, sessionId?: string, limit?: number, offset?: number, beginTimestamp?: number, endTimestamp?: number): Promise<{ success: boolean; messages?: any[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbSearchMessages) return { success: false, error: '当前 DLL 版本不支持搜索消息' }
+    if (!this.wcdbSearchMessages) return { success: false, error: '当前数据服务版本不支持搜索消息' }
     try {
       const handle = this.handle
       await new Promise(resolve => setImmediate(resolve))
@@ -3271,7 +3981,7 @@ export class WcdbCore {
 
   async getSnsTimeline(limit: number, offset: number, usernames?: string[], keyword?: string, startTime?: number, endTime?: number): Promise<{ success: boolean; timeline?: any[]; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbGetSnsTimeline) return { success: false, error: '当前 DLL 版本不支持获取朋友圈' }
+    if (!this.wcdbGetSnsTimeline) return { success: false, error: '当前数据服务版本不支持获取朋友圈' }
     try {
       const outPtr = [null as any]
       const usernamesJson = usernames && usernames.length > 0 ? JSON.stringify(usernames) : ''
@@ -3360,12 +4070,128 @@ export class WcdbCore {
       return { success: false, error: String(e) }
     }
   }
+
+  async installMessageAntiRevokeTrigger(sessionId: string): Promise<{ success: boolean; alreadyInstalled?: boolean; error?: string }> {
+    if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    if (!this.wcdbInstallMessageAntiRevokeTrigger) return { success: false, error: '当前数据服务版本不支持此功能' }
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return { success: false, error: 'sessionId 不能为空' }
+    try {
+      const outPtr = [null]
+      const status = this.wcdbInstallMessageAntiRevokeTrigger(this.handle, normalizedSessionId, outPtr)
+      let msg = ''
+      if (outPtr[0]) {
+        try { msg = this.koffi.decode(outPtr[0], 'char', -1) } catch { }
+        try { this.wcdbFreeString(outPtr[0]) } catch { }
+      }
+      if (status === 1) {
+        return { success: true, alreadyInstalled: true }
+      }
+      if (status !== 0) {
+        return { success: false, error: msg || `DLL error ${status}` }
+      }
+      return { success: true, alreadyInstalled: false }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async uninstallMessageAntiRevokeTrigger(sessionId: string): Promise<{ success: boolean; error?: string }> {
+    if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    if (!this.wcdbUninstallMessageAntiRevokeTrigger) return { success: false, error: '当前数据服务版本不支持此功能' }
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return { success: false, error: 'sessionId 不能为空' }
+    try {
+      const outPtr = [null]
+      const status = this.wcdbUninstallMessageAntiRevokeTrigger(this.handle, normalizedSessionId, outPtr)
+      let msg = ''
+      if (outPtr[0]) {
+        try { msg = this.koffi.decode(outPtr[0], 'char', -1) } catch { }
+        try { this.wcdbFreeString(outPtr[0]) } catch { }
+      }
+      if (status !== 0) {
+        return { success: false, error: msg || `DLL error ${status}` }
+      }
+      return { success: true }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async checkMessageAntiRevokeTrigger(sessionId: string): Promise<{ success: boolean; installed?: boolean; error?: string }> {
+    if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
+    if (!this.wcdbCheckMessageAntiRevokeTrigger) return { success: false, error: '当前数据服务版本不支持此功能' }
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return { success: false, error: 'sessionId 不能为空' }
+    try {
+      const outInstalled = [0]
+      const status = this.wcdbCheckMessageAntiRevokeTrigger(this.handle, normalizedSessionId, outInstalled)
+      if (status !== 0) {
+        return { success: false, error: `DLL error ${status}` }
+      }
+      return { success: true, installed: outInstalled[0] === 1 }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async checkMessageAntiRevokeTriggers(sessionIds: string[]): Promise<{
+    success: boolean
+    rows?: Array<{ sessionId: string; success: boolean; installed?: boolean; error?: string }>
+    error?: string
+  }> {
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return { success: true, rows: [] }
+    }
+    const uniqueIds = Array.from(new Set(sessionIds.map((id) => String(id || '').trim()).filter(Boolean)))
+    const rows: Array<{ sessionId: string; success: boolean; installed?: boolean; error?: string }> = []
+    for (const sessionId of uniqueIds) {
+      const result = await this.checkMessageAntiRevokeTrigger(sessionId)
+      rows.push({ sessionId, success: result.success, installed: result.installed, error: result.error })
+    }
+    return { success: true, rows }
+  }
+
+  async installMessageAntiRevokeTriggers(sessionIds: string[]): Promise<{
+    success: boolean
+    rows?: Array<{ sessionId: string; success: boolean; alreadyInstalled?: boolean; error?: string }>
+    error?: string
+  }> {
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return { success: true, rows: [] }
+    }
+    const uniqueIds = Array.from(new Set(sessionIds.map((id) => String(id || '').trim()).filter(Boolean)))
+    const rows: Array<{ sessionId: string; success: boolean; alreadyInstalled?: boolean; error?: string }> = []
+    for (const sessionId of uniqueIds) {
+      const result = await this.installMessageAntiRevokeTrigger(sessionId)
+      rows.push({ sessionId, success: result.success, alreadyInstalled: result.alreadyInstalled, error: result.error })
+    }
+    return { success: true, rows }
+  }
+
+  async uninstallMessageAntiRevokeTriggers(sessionIds: string[]): Promise<{
+    success: boolean
+    rows?: Array<{ sessionId: string; success: boolean; error?: string }>
+    error?: string
+  }> {
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return { success: true, rows: [] }
+    }
+    const uniqueIds = Array.from(new Set(sessionIds.map((id) => String(id || '').trim()).filter(Boolean)))
+    const rows: Array<{ sessionId: string; success: boolean; error?: string }> = []
+    for (const sessionId of uniqueIds) {
+      const result = await this.uninstallMessageAntiRevokeTrigger(sessionId)
+      rows.push({ sessionId, success: result.success, error: result.error })
+    }
+    return { success: true, rows }
+  }
+
   /**
    * 为朋友圈安装删除
    */
   async installSnsBlockDeleteTrigger(): Promise<{ success: boolean; alreadyInstalled?: boolean; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbInstallSnsBlockDeleteTrigger) return { success: false, error: '当前 DLL 版本不支持此功能' }
+    if (!this.wcdbInstallSnsBlockDeleteTrigger) return { success: false, error: '当前数据服务版本不支持此功能' }
     try {
       const outPtr = [null]
       const status = this.wcdbInstallSnsBlockDeleteTrigger(this.handle, outPtr)
@@ -3375,7 +4201,7 @@ export class WcdbCore {
         try { this.wcdbFreeString(outPtr[0]) } catch { }
       }
       if (status === 1) {
-        // DLL 返回 1 表示已安装
+        //数据服务返回 1 表示已安装
         return { success: true, alreadyInstalled: true }
       }
       if (status !== 0) {
@@ -3392,7 +4218,7 @@ export class WcdbCore {
    */
   async uninstallSnsBlockDeleteTrigger(): Promise<{ success: boolean; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbUninstallSnsBlockDeleteTrigger) return { success: false, error: '当前 DLL 版本不支持此功能' }
+    if (!this.wcdbUninstallSnsBlockDeleteTrigger) return { success: false, error: '当前数据服务版本不支持此功能' }
     try {
       const outPtr = [null]
       const status = this.wcdbUninstallSnsBlockDeleteTrigger(this.handle, outPtr)
@@ -3415,7 +4241,7 @@ export class WcdbCore {
    */
   async checkSnsBlockDeleteTrigger(): Promise<{ success: boolean; installed?: boolean; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbCheckSnsBlockDeleteTrigger) return { success: false, error: '当前 DLL 版本不支持此功能' }
+    if (!this.wcdbCheckSnsBlockDeleteTrigger) return { success: false, error: '当前数据服务版本不支持此功能' }
     try {
       const outInstalled = [0]
       const status = this.wcdbCheckSnsBlockDeleteTrigger(this.handle, outInstalled)
@@ -3430,7 +4256,7 @@ export class WcdbCore {
 
   async deleteSnsPost(postId: string): Promise<{ success: boolean; error?: string }> {
     if (!this.ensureReady()) return { success: false, error: 'WCDB 未连接' }
-    if (!this.wcdbDeleteSnsPost) return { success: false, error: '当前 DLL 版本不支持此功能' }
+    if (!this.wcdbDeleteSnsPost) return { success: false, error: '当前数据服务版本不支持此功能' }
     try {
       const outPtr = [null]
       const status = this.wcdbDeleteSnsPost(this.handle, postId, outPtr)

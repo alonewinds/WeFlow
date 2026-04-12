@@ -12,6 +12,7 @@ import {
   Database,
   Download,
   ExternalLink,
+  File as FileIcon,
   FolderOpen,
   Hash,
   Image as ImageIcon,
@@ -67,7 +68,7 @@ import './ExportPage.scss'
 type ConversationTab = 'private' | 'group' | 'official' | 'former_friend'
 type TaskStatus = 'queued' | 'running' | 'success' | 'error'
 type TaskScope = 'single' | 'multi' | 'content' | 'sns'
-type ContentType = 'text' | 'voice' | 'image' | 'video' | 'emoji'
+type ContentType = 'text' | 'voice' | 'image' | 'video' | 'emoji' | 'file'
 type ContentCardType = ContentType | 'sns'
 type SnsRankMode = 'likes' | 'comments'
 
@@ -88,6 +89,8 @@ interface ExportOptions {
   exportVoices: boolean
   exportVideos: boolean
   exportEmojis: boolean
+  exportFiles: boolean
+  maxFileSizeMb: number
   exportVoiceAsText: boolean
   excelCompactColumns: boolean
   txtColumns: string[]
@@ -181,6 +184,7 @@ interface ExportDialogState {
 
 const defaultTxtColumns = ['index', 'time', 'senderRole', 'messageType', 'content']
 const DETAIL_PRECISE_REFRESH_COOLDOWN_MS = 10 * 60 * 1000
+const TASK_PERFORMANCE_UPDATE_MIN_INTERVAL_MS = 900
 const SESSION_MEDIA_METRIC_PREFETCH_ROWS = 10
 const SESSION_MEDIA_METRIC_BATCH_SIZE = 8
 const SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE = 48
@@ -195,8 +199,10 @@ const contentTypeLabels: Record<ContentType, string> = {
   voice: '语音',
   image: '图片',
   video: '视频',
-  emoji: '表情包'
+  emoji: '表情包',
+  file: '文件'
 }
+const FILE_SIZE_PRESETS_MB = [0, 100, 200, 500, 1024] as const
 
 const backgroundTaskSourceLabels: Record<string, string> = {
   export: '导出页',
@@ -311,9 +317,7 @@ const cloneTaskPerformance = (performance?: TaskPerformance): TaskPerformance =>
     write: performance?.stages.write || 0,
     other: performance?.stages.other || 0
   },
-  sessions: Object.fromEntries(
-    Object.entries(performance?.sessions || {}).map(([sessionId, session]) => [sessionId, { ...session }])
-  )
+  sessions: { ...(performance?.sessions || {}) }
 })
 
 const resolveTaskSessionName = (task: ExportTask, sessionId: string, fallback?: string): string => {
@@ -332,6 +336,18 @@ const applyProgressToTaskPerformance = (
   if (!isTextBatchTask(task)) return task.performance
   const sessionId = String(payload.currentSessionId || '').trim()
   if (!sessionId) return task.performance || createEmptyTaskPerformance()
+
+  const currentPerformance = task.performance
+  const currentSession = currentPerformance?.sessions?.[sessionId]
+  if (
+    payload.phase !== 'complete' &&
+    currentSession &&
+    currentSession.lastPhase === payload.phase &&
+    typeof currentSession.lastPhaseStartedAt === 'number' &&
+    now - currentSession.lastPhaseStartedAt < TASK_PERFORMANCE_UPDATE_MIN_INTERVAL_MS
+  ) {
+    return currentPerformance
+  }
 
   const performance = cloneTaskPerformance(task.performance)
   const sessionName = resolveTaskSessionName(task, sessionId, payload.currentSession || sessionId)
@@ -368,7 +384,9 @@ const applyProgressToTaskPerformance = (
 const finalizeTaskPerformance = (task: ExportTask, now: number): TaskPerformance | undefined => {
   if (!isTextBatchTask(task) || !task.performance) return task.performance
   const performance = cloneTaskPerformance(task.performance)
-  for (const session of Object.values(performance.sessions)) {
+  const nextSessions: Record<string, TaskSessionPerformance> = {}
+  for (const [sessionId, sourceSession] of Object.entries(performance.sessions)) {
+    const session: TaskSessionPerformance = { ...sourceSession }
     if (session.finishedAt) continue
     if (session.lastPhase && typeof session.lastPhaseStartedAt === 'number') {
       const delta = Math.max(0, now - session.lastPhaseStartedAt)
@@ -378,7 +396,13 @@ const finalizeTaskPerformance = (task: ExportTask, now: number): TaskPerformance
     session.finishedAt = now
     session.lastPhase = undefined
     session.lastPhaseStartedAt = undefined
+    nextSessions[sessionId] = session
   }
+  for (const [sessionId, sourceSession] of Object.entries(performance.sessions)) {
+    if (nextSessions[sessionId]) continue
+    nextSessions[sessionId] = { ...sourceSession }
+  }
+  performance.sessions = nextSessions
   return performance
 }
 
@@ -1081,21 +1105,42 @@ const clampExportSelectionToBounds = (
 ): ExportDateRangeSelection => {
   if (!bounds) return cloneExportDateRangeSelection(selection)
 
-  const boundedStart = startOfDay(bounds.minDate)
-  const boundedEnd = endOfDay(bounds.maxDate)
-  const originalStart = selection.useAllTime ? boundedStart : startOfDay(selection.dateRange.start)
-  const originalEnd = selection.useAllTime ? boundedEnd : endOfDay(selection.dateRange.end)
-  const nextStart = new Date(Math.min(Math.max(originalStart.getTime(), boundedStart.getTime()), boundedEnd.getTime()))
-  const nextEndCandidate = new Date(Math.min(Math.max(originalEnd.getTime(), boundedStart.getTime()), boundedEnd.getTime()))
-  const nextEnd = nextEndCandidate.getTime() < nextStart.getTime() ? endOfDay(nextStart) : nextEndCandidate
-  const rangeChanged = nextStart.getTime() !== originalStart.getTime() || nextEnd.getTime() !== originalEnd.getTime()
+  // For custom selections, only ensure end >= start, preserve time precision
+  if (selection.preset === 'custom' && !selection.useAllTime) {
+    const { start, end } = selection.dateRange
+    if (end.getTime() < start.getTime()) {
+      return {
+        ...selection,
+        dateRange: { start, end: start }
+      }
+    }
+    return cloneExportDateRangeSelection(selection)
+  }
 
+  // For useAllTime, use bounds directly
+  if (selection.useAllTime) {
+    return {
+      preset: selection.preset,
+      useAllTime: true,
+      dateRange: {
+        start: bounds.minDate,
+        end: bounds.maxDate
+      }
+    }
+  }
+
+  // For preset selections (not custom), clamp dates to bounds and use default times
+  const boundedStart = new Date(Math.min(Math.max(selection.dateRange.start.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
+  const boundedEnd = new Date(Math.min(Math.max(selection.dateRange.end.getTime(), bounds.minDate.getTime()), bounds.maxDate.getTime()))
+  // Use default times: start at 00:00, end at 23:59:59
+  boundedStart.setHours(0, 0, 0, 0)
+  boundedEnd.setHours(23, 59, 59, 999)
   return {
-    preset: selection.useAllTime ? selection.preset : (rangeChanged ? 'custom' : selection.preset),
-    useAllTime: selection.useAllTime,
+    preset: selection.preset,
+    useAllTime: false,
     dateRange: {
-      start: nextStart,
-      end: nextEnd
+      start: boundedStart,
+      end: boundedEnd
     }
   }
 }
@@ -1188,16 +1233,18 @@ const WriteLayoutSelector = memo(function WriteLayoutSelector({
   const writeLayoutLabel = writeLayoutOptions.find(option => option.value === writeLayout)?.label || 'A（类型分目录）'
 
   return (
-    <div className="write-layout-control" ref={containerRef}>
+    <div className={`write-layout-control ${isOpen ? 'open' : ''}`} ref={containerRef}>
       <span className="control-label">写入目录方式</span>
       <button
         className={`layout-trigger ${isOpen ? 'active' : ''}`}
         type="button"
         onClick={() => setIsOpen(prev => !prev)}
+        aria-expanded={isOpen}
+        aria-haspopup="listbox"
       >
         {writeLayoutLabel}
       </button>
-      <div className={`layout-dropdown ${isOpen ? 'open' : ''}`}>
+      <div className={`layout-dropdown ${isOpen ? 'open' : ''}`} role="listbox" aria-label="写入目录方式">
         {writeLayoutOptions.map(option => (
           <button
             key={option.value}
@@ -1314,7 +1361,7 @@ const TaskCenterModal = memo(function TaskCenterModal({
 }: TaskCenterModalProps) {
   if (!isOpen) return null
 
-  return (
+  return createPortal(
     <div
       className="task-center-modal-overlay"
       onClick={onClose}
@@ -1511,7 +1558,8 @@ const TaskCenterModal = memo(function TaskCenterModal({
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   )
 })
 
@@ -1594,11 +1642,13 @@ function ExportPage() {
   const [exportDefaultFormat, setExportDefaultFormat] = useState<TextExportFormat>('excel')
   const [exportDefaultAvatars, setExportDefaultAvatars] = useState(true)
   const [exportDefaultDateRangeSelection, setExportDefaultDateRangeSelection] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
+  const [exportDefaultFileNamingMode, setExportDefaultFileNamingMode] = useState<configService.ExportFileNamingMode>('classic')
   const [exportDefaultMedia, setExportDefaultMedia] = useState<configService.ExportDefaultMediaConfig>({
     images: true,
     videos: true,
     voices: true,
-    emojis: true
+    emojis: true,
+    files: true
   })
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
   const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
@@ -1617,7 +1667,9 @@ function ExportPage() {
     exportImages: true,
     exportVoices: true,
     exportVideos: true,
-        exportEmojis: true,
+    exportEmojis: true,
+    exportFiles: true,
+    maxFileSizeMb: 200,
     exportVoiceAsText: false,
     excelCompactColumns: true,
     txtColumns: defaultTxtColumns,
@@ -2240,7 +2292,7 @@ function ExportPage() {
     setIsBaseConfigLoading(true)
     let isReady = true
     try {
-      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedImageDeepSearchOnMiss, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, exportCacheScope] = await Promise.all([
+      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedImageDeepSearchOnMiss, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, savedFileNamingMode, exportCacheScope] = await Promise.all([
         configService.getExportPath(),
         configService.getExportDefaultFormat(),
         configService.getExportDefaultAvatars(),
@@ -2257,6 +2309,7 @@ function ExportPage() {
         configService.getExportWriteLayout(),
         configService.getExportSessionNamePrefixEnabled(),
         configService.getExportDefaultDateRange(),
+        configService.getExportDefaultFileNamingMode(),
         ensureExportCacheScope()
       ])
 
@@ -2281,12 +2334,14 @@ function ExportPage() {
         images: true,
         videos: true,
         voices: true,
-        emojis: true
+        emojis: true,
+        files: true
       })
       setExportDefaultVoiceAsText(savedVoiceAsText ?? false)
       setExportDefaultExcelCompactColumns(savedExcelCompactColumns ?? true)
       setExportDefaultConcurrency(savedConcurrency ?? 2)
       setExportDefaultImageDeepSearchOnMiss(savedImageDeepSearchOnMiss ?? true)
+      setExportDefaultFileNamingMode(savedFileNamingMode ?? 'classic')
       const resolvedDefaultDateRange = resolveExportDateRangeConfig(savedDefaultDateRange)
       setExportDefaultDateRangeSelection(resolvedDefaultDateRange)
       setTimeRangeSelection(resolvedDefaultDateRange)
@@ -2310,12 +2365,14 @@ function ExportPage() {
           (savedMedia?.images ?? prev.exportImages) ||
           (savedMedia?.voices ?? prev.exportVoices) ||
           (savedMedia?.videos ?? prev.exportVideos) ||
-          (savedMedia?.emojis ?? prev.exportEmojis)
+          (savedMedia?.emojis ?? prev.exportEmojis) ||
+          (savedMedia?.files ?? prev.exportFiles)
         ),
         exportImages: savedMedia?.images ?? prev.exportImages,
         exportVoices: savedMedia?.voices ?? prev.exportVoices,
         exportVideos: savedMedia?.videos ?? prev.exportVideos,
         exportEmojis: savedMedia?.emojis ?? prev.exportEmojis,
+        exportFiles: savedMedia?.files ?? prev.exportFiles,
         exportVoiceAsText: savedVoiceAsText ?? prev.exportVoiceAsText,
         excelCompactColumns: savedExcelCompactColumns ?? prev.excelCompactColumns,
         txtColumns,
@@ -4088,12 +4145,15 @@ function ExportPage() {
           exportDefaultMedia.images ||
           exportDefaultMedia.voices ||
           exportDefaultMedia.videos ||
-          exportDefaultMedia.emojis
+          exportDefaultMedia.emojis ||
+          exportDefaultMedia.files
         ),
         exportImages: exportDefaultMedia.images,
         exportVoices: exportDefaultMedia.voices,
         exportVideos: exportDefaultMedia.videos,
         exportEmojis: exportDefaultMedia.emojis,
+        exportFiles: exportDefaultMedia.files,
+        maxFileSizeMb: prev.maxFileSizeMb,
         exportVoiceAsText: exportDefaultVoiceAsText,
         excelCompactColumns: exportDefaultExcelCompactColumns,
         exportConcurrency: exportDefaultConcurrency,
@@ -4111,12 +4171,14 @@ function ExportPage() {
           next.exportVoices = false
           next.exportVideos = false
           next.exportEmojis = false
+          next.exportFiles = false
         } else {
           next.exportMedia = true
           next.exportImages = payload.contentType === 'image'
           next.exportVoices = payload.contentType === 'voice'
           next.exportVideos = payload.contentType === 'video'
           next.exportEmojis = payload.contentType === 'emoji'
+          next.exportFiles = payload.contentType === 'file'
           next.exportVoiceAsText = false
         }
       }
@@ -4335,7 +4397,13 @@ function ExportPage() {
 
   const buildExportOptions = (scope: TaskScope, contentType?: ContentType): ElectronExportOptions => {
     const sessionLayout: SessionLayout = writeLayout === 'C' ? 'per-session' : 'shared'
-    const exportMediaEnabled = Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis)
+    const exportMediaEnabled = Boolean(
+      options.exportImages ||
+      options.exportVoices ||
+      options.exportVideos ||
+      options.exportEmojis ||
+      options.exportFiles
+    )
 
     const base: ElectronExportOptions = {
       format: options.format,
@@ -4345,12 +4413,15 @@ function ExportPage() {
       exportVoices: options.exportVoices,
       exportVideos: options.exportVideos,
       exportEmojis: options.exportEmojis,
+      exportFiles: options.exportFiles,
+      maxFileSizeMb: options.maxFileSizeMb,
       exportVoiceAsText: options.exportVoiceAsText,
       excelCompactColumns: options.excelCompactColumns,
       txtColumns: options.txtColumns,
       displayNamePreference: options.displayNamePreference,
       exportConcurrency: options.exportConcurrency,
       imageDeepSearchOnMiss: options.imageDeepSearchOnMiss,
+      fileNamingMode: exportDefaultFileNamingMode,
       sessionLayout,
       sessionNameWithTypePrefix,
       dateRange: options.useAllTime
@@ -4375,7 +4446,8 @@ function ExportPage() {
           exportImages: false,
           exportVoices: false,
           exportVideos: false,
-          exportEmojis: false
+          exportEmojis: false,
+          exportFiles: false
         }
       }
 
@@ -4387,6 +4459,7 @@ function ExportPage() {
         exportVoices: contentType === 'voice',
         exportVideos: contentType === 'video',
         exportEmojis: contentType === 'emoji',
+        exportFiles: contentType === 'file',
         exportVoiceAsText: false
       }
     }
@@ -4452,6 +4525,7 @@ function ExportPage() {
       if (opts.exportVoices) labels.push('语音')
       if (opts.exportVideos) labels.push('视频')
       if (opts.exportEmojis) labels.push('表情包')
+      if (opts.exportFiles) labels.push('文件')
     }
     return Array.from(new Set(labels)).join('、')
   }, [])
@@ -4507,6 +4581,7 @@ function ExportPage() {
       if (opts.exportImages) types.push('image')
       if (opts.exportVideos) types.push('video')
       if (opts.exportEmojis) types.push('emoji')
+      if (opts.exportFiles) types.push('file')
     }
     return types
   }
@@ -4697,7 +4772,7 @@ function ExportPage() {
         queuedProgressTimer = window.setTimeout(() => {
           queuedProgressTimer = null
           flushQueuedProgress()
-        }, 100)
+        }, 180)
       })
     }
     if (next.payload.scope === 'sns') {
@@ -4937,7 +5012,8 @@ function ExportPage() {
       images: options.exportImages,
       voices: options.exportVoices,
       videos: options.exportVideos,
-      emojis: options.exportEmojis
+      emojis: options.exportEmojis,
+      files: options.exportFiles
     })
     await configService.setExportDefaultVoiceAsText(options.exportVoiceAsText)
     await configService.setExportDefaultExcelCompactColumns(options.excelCompactColumns)
@@ -6445,6 +6521,10 @@ function ExportPage() {
   const useCollapsedSessionFormatSelector = isSessionScopeDialog || isContentTextDialog
   const shouldShowFormatSection = !isContentScopeDialog || isContentTextDialog
   const shouldShowMediaSection = !isContentScopeDialog
+  const shouldRenderImageDeepSearchToggle = exportDialog.scope !== 'sns' && (
+    isSessionScopeDialog ||
+    (isContentScopeDialog && exportDialog.contentType === 'image')
+  )
   const shouldShowImageDeepSearchToggle = exportDialog.scope !== 'sns' && (
     (isSessionScopeDialog && options.exportImages) ||
     (isContentScopeDialog && exportDialog.contentType === 'image')
@@ -6454,6 +6534,80 @@ function ExportPage() {
   const activeDialogFormatLabel = exportDialog.scope === 'sns'
     ? (snsFormatOptions.find(option => option.value === snsExportFormat)?.label ?? snsExportFormat)
     : (formatOptions.find(option => option.value === options.format)?.label ?? options.format)
+  const sessionMediaOptions = [
+    {
+      key: 'images',
+      label: '图片',
+      desc: '聊天图片与缩略图',
+      icon: ImageIcon,
+      checked: options.exportImages,
+      onToggle: (checked: boolean) => setOptions(prev => ({ ...prev, exportImages: checked }))
+    },
+    {
+      key: 'voices',
+      label: '语音',
+      desc: '语音消息文件',
+      icon: Mic,
+      checked: options.exportVoices,
+      onToggle: (checked: boolean) => setOptions(prev => ({ ...prev, exportVoices: checked }))
+    },
+    {
+      key: 'videos',
+      label: '视频',
+      desc: '聊天视频与封面',
+      icon: Video,
+      checked: options.exportVideos,
+      onToggle: (checked: boolean) => setOptions(prev => ({ ...prev, exportVideos: checked }))
+    },
+    {
+      key: 'emojis',
+      label: '表情包',
+      desc: '静态与动态表情',
+      icon: MessageSquare,
+      checked: options.exportEmojis,
+      onToggle: (checked: boolean) => setOptions(prev => ({ ...prev, exportEmojis: checked }))
+    },
+    {
+      key: 'files',
+      label: '文件',
+      desc: '文档与附件',
+      icon: FileIcon,
+      checked: options.exportFiles,
+      onToggle: (checked: boolean) => setOptions(prev => ({ ...prev, exportFiles: checked }))
+    }
+  ]
+  const snsMediaOptions = [
+    {
+      key: 'images',
+      label: '图片',
+      desc: '朋友圈图片',
+      icon: ImageIcon,
+      checked: snsExportImages,
+      onToggle: (checked: boolean) => setSnsExportImages(checked)
+    },
+    {
+      key: 'live-photos',
+      label: '实况图',
+      desc: 'Live Photo',
+      icon: Aperture,
+      checked: snsExportLivePhotos,
+      onToggle: (checked: boolean) => setSnsExportLivePhotos(checked)
+    },
+    {
+      key: 'videos',
+      label: '视频',
+      desc: '朋友圈视频',
+      icon: Video,
+      checked: snsExportVideos,
+      onToggle: (checked: boolean) => setSnsExportVideos(checked)
+    }
+  ]
+  const dialogMediaOptions = exportDialog.scope === 'sns' ? snsMediaOptions : sessionMediaOptions
+  const mediaSelectionSummaryLabel = `已选择 ${dialogMediaOptions.filter(option => option.checked).length}/${dialogMediaOptions.length}`
+  const voiceAsTextStatusLabel = options.exportVoices
+    ? '已勾选导出语音：会同时导出语音文件，并在文本中追加语音转写结果。'
+    : '未勾选导出语音时，仅在文本里追加语音转写结果，不导出语音文件。'
+  const fileSizeLimitLabel = options.maxFileSizeMb <= 0 ? '不限' : `${options.maxFileSizeMb} MB`
   const shouldShowDisplayNameSection = !(
     exportDialog.scope === 'sns' ||
     (
@@ -6472,18 +6626,15 @@ function ExportPage() {
   const taskQueuedCount = tasks.filter(task => task.status === 'queued').length
   const taskCenterAlertCount = taskRunningCount + taskQueuedCount
   const hasFilteredContacts = filteredContacts.length > 0
-  const contactsTableMinWidth = useMemo(() => {
-    const baseWidth = 24 + 34 + 44 + 280 + 120 + (4 * 72) + 140 + (8 * 12)
-    const snsWidth = shouldShowSnsColumn ? 72 + 12 : 0
-    const mutualFriendsWidth = shouldShowMutualFriendsColumn ? 72 + 12 : 0
-    return baseWidth + snsWidth + mutualFriendsWidth
-  }, [shouldShowMutualFriendsColumn, shouldShowSnsColumn])
+  const optionalMetricColumnCount = (shouldShowSnsColumn ? 1 : 0) + (shouldShowMutualFriendsColumn ? 1 : 0)
+  const contactsMetricColumnCount = 4 + optionalMetricColumnCount
+  const contactsColumnGapCount = 6 + optionalMetricColumnCount
   const contactsTableStyle = useMemo(() => (
     {
-      ['--contacts-table-min-width' as const]: `${contactsTableMinWidth}px`
+      ['--contacts-table-min-width' as const]: `calc((2 * var(--contacts-inline-padding)) + var(--contacts-left-sticky-width) + var(--contacts-message-col-width) + (${contactsMetricColumnCount} * var(--contacts-media-col-width)) + var(--contacts-actions-sticky-width) + (${contactsColumnGapCount} * var(--contacts-column-gap)))`
     } as CSSProperties
-  ), [contactsTableMinWidth])
-  const hasContactsHorizontalOverflow = contactsHorizontalScrollMetrics.contentWidth - contactsHorizontalScrollMetrics.viewportWidth > 1
+  ), [contactsColumnGapCount, contactsMetricColumnCount])
+  const hasContactsHorizontalOverflow = contactsHorizontalScrollMetrics.contentWidth - contactsHorizontalScrollMetrics.viewportWidth > 4
   const contactsBottomScrollbarInnerStyle = useMemo<CSSProperties>(() => ({
     width: `${Math.max(contactsHorizontalScrollMetrics.contentWidth, contactsHorizontalScrollMetrics.viewportWidth)}px`
   }), [contactsHorizontalScrollMetrics.contentWidth, contactsHorizontalScrollMetrics.viewportWidth])
@@ -6664,7 +6815,7 @@ function ExportPage() {
   const toggleTaskPerfDetail = useCallback((taskId: string) => {
     setExpandedPerfTaskId(prev => (prev === taskId ? null : taskId))
   }, [])
-  const renderContactRow = useCallback((_: number, contact: ContactInfo) => {
+  const renderContactRow = useCallback((index: number, contact: ContactInfo) => {
     const matchedSession = sessionRowByUsername.get(contact.username)
     const canExport = Boolean(matchedSession?.hasSession)
     const isSessionBindingPending = !matchedSession && (isLoading || isSessionEnriching)
@@ -6730,8 +6881,21 @@ function ExportPage() {
       : contact.type === 'group'
         ? '打开群聊'
         : '打开对话'
+    const previousContact = index > 0 ? filteredContacts[index - 1] : null
+    const nextContact = index < filteredContacts.length - 1 ? filteredContacts[index + 1] : null
+    const previousCanExport = Boolean(previousContact && sessionRowByUsername.get(previousContact.username)?.hasSession)
+    const nextCanExport = Boolean(nextContact && sessionRowByUsername.get(nextContact.username)?.hasSession)
+    const previousSelected = Boolean(previousContact && previousCanExport && selectedSessions.has(previousContact.username))
+    const nextSelected = Boolean(nextContact && nextCanExport && selectedSessions.has(nextContact.username))
+    const resolvedAvatarUrl = normalizeExportAvatarUrl(matchedSession?.avatarUrl || contact.avatarUrl)
+    const rowClassName = [
+      'contact-row',
+      checked ? 'selected' : '',
+      checked && previousSelected ? 'selected-contiguous-top' : '',
+      checked && nextSelected ? 'selected-contiguous-bottom' : ''
+    ].filter(Boolean).join(' ')
     return (
-      <div className={`contact-row ${checked ? 'selected' : ''}`}>
+      <div className={rowClassName}>
         <div className="contact-item">
           <div className="row-left-sticky">
             <div className="row-select-cell">
@@ -6747,7 +6911,7 @@ function ExportPage() {
             </div>
             <div className="contact-avatar">
               <Avatar
-                src={normalizeExportAvatarUrl(contact.avatarUrl)}
+                src={resolvedAvatarUrl}
                 name={contact.displayName}
                 size="100%"
                 shape="rounded"
@@ -6880,6 +7044,7 @@ function ExportPage() {
       </div>
     )
   }, [
+    filteredContacts,
     lastExportBySession,
     navigate,
     nowTick,
@@ -6950,16 +7115,20 @@ function ExportPage() {
     if (patch.dateRange) {
       setExportDefaultDateRangeSelection(patch.dateRange)
     }
+    if (patch.fileNamingMode) {
+      setExportDefaultFileNamingMode(patch.fileNamingMode)
+    }
     if (patch.media) {
       const mediaPatch = patch.media
       setExportDefaultMedia(mediaPatch)
       setOptions(prev => ({
         ...prev,
-        exportMedia: Boolean(mediaPatch.images || mediaPatch.voices || mediaPatch.videos || mediaPatch.emojis),
+        exportMedia: Boolean(mediaPatch.images || mediaPatch.voices || mediaPatch.videos || mediaPatch.emojis || mediaPatch.files),
         exportImages: mediaPatch.images,
         exportVoices: mediaPatch.voices,
         exportVideos: mediaPatch.videos,
-        exportEmojis: mediaPatch.emojis
+        exportEmojis: mediaPatch.emojis,
+        exportFiles: mediaPatch.files
       }))
     }
     if (typeof patch.voiceAsText === 'boolean') {
@@ -7048,7 +7217,7 @@ function ExportPage() {
         onTogglePerfTask={toggleTaskPerfDetail}
       />
 
-      {isExportDefaultsModalOpen && (
+      {isExportDefaultsModalOpen && createPortal(
         <div
           className="export-defaults-modal-overlay"
           onClick={() => setIsExportDefaultsModalOpen(false)}
@@ -7086,7 +7255,8 @@ function ExportPage() {
               </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       <div className="export-section-title-row">
@@ -7171,7 +7341,7 @@ function ExportPage() {
           ]}
         />
         <button
-          className={`session-load-detail-entry ${isSessionLoadDetailActive ? 'active' : ''}`}
+          className={`session-load-detail-entry ${showSessionLoadDetailModal ? 'open' : ''} ${isSessionLoadDetailActive && !showSessionLoadDetailModal ? 'active' : ''}`.trim()}
           type="button"
           onClick={() => setShowSessionLoadDetailModal(true)}
         >
@@ -7381,7 +7551,7 @@ function ExportPage() {
             )}
           </div>
 
-          {showSessionLoadDetailModal && (
+          {showSessionLoadDetailModal && createPortal(
             <div
               className="session-load-detail-overlay"
               onClick={() => setShowSessionLoadDetailModal(false)}
@@ -7616,10 +7786,11 @@ function ExportPage() {
                   </section>
                 </div>
               </div>
-            </div>
+            </div>,
+            document.body
           )}
 
-          {sessionMutualFriendsDialogTarget && sessionMutualFriendsDialogMetric && (
+          {sessionMutualFriendsDialogTarget && sessionMutualFriendsDialogMetric && createPortal(
             <div
               className="session-mutual-friends-overlay"
               onClick={closeSessionMutualFriendsDialog}
@@ -7702,10 +7873,11 @@ function ExportPage() {
                   )}
                 </div>
               </div>
-            </div>
+            </div>,
+            document.body
           )}
 
-          {showSessionDetailPanel && (
+          {showSessionDetailPanel && createPortal(
             <div
               className="export-session-detail-overlay"
               onClick={closeSessionDetailPanel}
@@ -7807,19 +7979,15 @@ function ExportPage() {
                       <div className="detail-record-list">
                         {currentSessionExportRecords.map((record, index) => (
                           <div className="detail-record-item" key={`${record.exportTime}-${record.content}-${index}`}>
-                            <div className="record-row">
-                              <span className="label">导出时间</span>
-                              <span className="value">{formatYmdHmDateTime(record.exportTime)}</span>
+                            <div className="detail-record-head">
+                              <span className="record-export-time">{formatYmdHmDateTime(record.exportTime)}</span>
+                              <span className="record-content-pill" title={record.content}>{record.content}</span>
                             </div>
-                            <div className="record-row">
-                              <span className="label">导出内容</span>
-                              <span className="value">{record.content}</span>
-                            </div>
-                            <div className="record-row">
-                              <span className="label">导出目录</span>
-                              <span className="value path" title={record.outputDir}>{formatPathBrief(record.outputDir)}</span>
+                            <div className="detail-record-path-row">
+                              <span className="path-label">导出目录</span>
+                              <span className="path-value" title={record.outputDir}>{formatPathBrief(record.outputDir)}</span>
                               <button
-                                className="detail-inline-btn"
+                                className="detail-inline-btn detail-record-open-btn"
                                 type="button"
                                 onClick={() => void window.electronAPI.shell.openPath(record.outputDir)}
                               >
@@ -7835,7 +8003,7 @@ function ExportPage() {
                   <div className="detail-section">
                     <div className="section-title">
                       <MessageSquare size={14} />
-                      <span>消息统计（导出口径）</span>
+                      <span>消息统计</span>
                     </div>
                     <div className="detail-stats-meta">
                       {isRefreshingSessionDetailStats
@@ -8018,7 +8186,8 @@ function ExportPage() {
                 <div className="detail-empty">暂无详情</div>
               )}
               </aside>
-            </div>
+            </div>,
+            document.body
           )}
 
           <ContactSnsTimelineDialog
@@ -8128,6 +8297,8 @@ function ExportPage() {
                 </div>
               )}
 
+
+
               <div className="dialog-section">
                 <div className="section-header-action">
                   <h4>时间范围</h4>
@@ -8145,45 +8316,103 @@ function ExportPage() {
 
               {shouldShowMediaSection && (
                 <div className="dialog-section">
-                  <h4>{exportDialog.scope === 'sns' ? '媒体文件（可多选）' : '媒体内容'}</h4>
-                  <div className="media-check-grid">
-                    {exportDialog.scope === 'sns' ? (
-                      <>
-                        <label><input type="checkbox" checked={snsExportImages} onChange={event => setSnsExportImages(event.target.checked)} /> 图片</label>
-                        <label><input type="checkbox" checked={snsExportLivePhotos} onChange={event => setSnsExportLivePhotos(event.target.checked)} /> 实况图</label>
-                        <label><input type="checkbox" checked={snsExportVideos} onChange={event => setSnsExportVideos(event.target.checked)} /> 视频</label>
-                      </>
-                    ) : (
-                      <>
-                        <label><input type="checkbox" checked={options.exportImages} onChange={event => setOptions(prev => ({ ...prev, exportImages: event.target.checked }))} /> 图片</label>
-                        <label><input type="checkbox" checked={options.exportVoices} onChange={event => setOptions(prev => ({ ...prev, exportVoices: event.target.checked }))} /> 语音</label>
-                        <label><input type="checkbox" checked={options.exportVideos} onChange={event => setOptions(prev => ({ ...prev, exportVideos: event.target.checked }))} /> 视频</label>
-                        <label><input type="checkbox" checked={options.exportEmojis} onChange={event => setOptions(prev => ({ ...prev, exportEmojis: event.target.checked }))} /> 表情包</label>
-                      </>
-                    )}
+                  <div className="section-header-action media-section-header">
+                    <h4>{exportDialog.scope === 'sns' ? '媒体文件（可多选）' : '媒体内容'}</h4>
+                    <span className="media-selection-pill">{mediaSelectionSummaryLabel}</span>
                   </div>
-                  {exportDialog.scope === 'sns' && (
-                    <div className="format-note">全不勾选时仅导出文本信息，不导出媒体文件。</div>
+                  <div className="media-option-grid">
+                    {dialogMediaOptions.map(option => {
+                      const Icon = option.icon
+                      return (
+                        <label key={option.key} className={`media-option-card ${option.checked ? 'active' : ''}`}>
+                          <input
+                            className="media-option-input"
+                            type="checkbox"
+                            checked={option.checked}
+                            onChange={event => option.onToggle(event.target.checked)}
+                          />
+                          <span className="media-option-main">
+                            <span className="media-option-icon">
+                              <Icon size={16} />
+                            </span>
+                            <span className="media-option-text">
+                              <span className="media-option-label">{option.label}</span>
+                              <span className="media-option-desc">{option.desc}</span>
+                            </span>
+                          </span>
+                          <span className={`media-option-check ${option.checked ? 'active' : ''}`}>
+                            <Check size={12} />
+                          </span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                  {exportDialog.scope !== 'sns' && (
+                    <div
+                      className={`dialog-collapse-slot ${options.exportFiles ? 'open' : ''}`}
+                      aria-hidden={!options.exportFiles}
+                    >
+                      <div className="dialog-collapse-inner">
+                        <div className="file-size-subsection">
+                          <div className="file-size-subsection-header">
+                            <div className="file-size-heading">文件大小上限</div>
+                            <div className="file-size-current">{fileSizeLimitLabel}</div>
+                          </div>
+                          <div className="file-size-note">
+                            文件导出优先使用消息中的 MD5 做校验；设置上限后，只导出不超过该值的文件。
+                          </div>
+                          <div className="file-size-preset-row">
+                            {FILE_SIZE_PRESETS_MB.map(preset => (
+                              <button
+                                key={preset}
+                                type="button"
+                                className={`file-size-preset-btn ${options.maxFileSizeMb === preset ? 'active' : ''}`}
+                                onClick={() => setOptions(prev => ({ ...prev, maxFileSizeMb: preset }))}
+                              >
+                                {preset === 0 ? '不限' : `${preset}MB`}
+                              </button>
+                            ))}
+                          </div>
+                          <div className="dialog-input-row">
+                            <input
+                              type="number"
+                              min={0}
+                              step={10}
+                              value={options.maxFileSizeMb}
+                              onChange={event => {
+                                const raw = Number(event.target.value)
+                                setOptions(prev => ({ ...prev, maxFileSizeMb: Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0 }))
+                              }}
+                            />
+                            <span>MB</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
                   )}
                 </div>
               )}
 
-              {shouldShowImageDeepSearchToggle && (
-                <div className="dialog-section">
-                  <div className="dialog-switch-row">
-                    <div className="dialog-switch-copy">
-                      <h4>缺图时深度搜索</h4>
-                      <div className="format-note">关闭后仅尝试 hardlink 命中，未命中将直接显示占位符，导出速度更快。</div>
+              {shouldRenderImageDeepSearchToggle && (
+                <div className={`dialog-collapse-slot ${shouldShowImageDeepSearchToggle ? 'open' : ''}`} aria-hidden={!shouldShowImageDeepSearchToggle}>
+                  <div className="dialog-collapse-inner">
+                    <div className="dialog-section">
+                      <div className="dialog-switch-row">
+                        <div className="dialog-switch-copy">
+                          <h4>缺图时深度搜索</h4>
+                          <div className="format-note">关闭后仅尝试 hardlink 命中，未命中将直接显示占位符，导出速度更快。</div>
+                        </div>
+                        <button
+                          type="button"
+                          className={`dialog-switch ${options.imageDeepSearchOnMiss ? 'on' : ''}`}
+                          aria-pressed={options.imageDeepSearchOnMiss}
+                          aria-label="切换缺图时深度搜索"
+                          onClick={() => setOptions(prev => ({ ...prev, imageDeepSearchOnMiss: !prev.imageDeepSearchOnMiss }))}
+                        >
+                          <span className="dialog-switch-thumb" />
+                        </button>
+                      </div>
                     </div>
-                    <button
-                      type="button"
-                      className={`dialog-switch ${options.imageDeepSearchOnMiss ? 'on' : ''}`}
-                      aria-pressed={options.imageDeepSearchOnMiss}
-                      aria-label="切换缺图时深度搜索"
-                      onClick={() => setOptions(prev => ({ ...prev, imageDeepSearchOnMiss: !prev.imageDeepSearchOnMiss }))}
-                    >
-                      <span className="dialog-switch-thumb" />
-                    </button>
                   </div>
                 </div>
               )}
@@ -8194,6 +8423,7 @@ function ExportPage() {
                     <div className="dialog-switch-copy">
                       <h4>语音转文字</h4>
                       <div className="format-note">默认状态跟随更多导出设置中的语音转文字开关。</div>
+                      <div className="format-note">{voiceAsTextStatusLabel}</div>
                     </div>
                     <button
                       type="button"
@@ -8208,27 +8438,51 @@ function ExportPage() {
                 </div>
               )}
 
-              {shouldShowDisplayNameSection && (
+              {(shouldShowDisplayNameSection || options.format === 'excel') && (
                 <div className="dialog-section">
-                  <h4>发送者名称显示</h4>
-                  <div className="display-name-options" role="radiogroup" aria-label="发送者名称显示">
-                    {displayNameOptions.map(option => {
-                      const isActive = options.displayNamePreference === option.value
-                      return (
-                        <button
-                          key={option.value}
-                          type="button"
-                          role="radio"
-                          aria-checked={isActive}
-                          className={`display-name-item ${isActive ? 'active' : ''}`}
-                          onClick={() => setOptions(prev => ({ ...prev, displayNamePreference: option.value }))}
-                        >
-                          <span>{option.label}</span>
-                          <small>{option.desc}</small>
-                        </button>
-                      )
-                    })}
-                  </div>
+                  {shouldShowDisplayNameSection && (
+                    <>
+                      <h4>发送者名称显示</h4>
+                      <div className="display-name-options" role="radiogroup" aria-label="发送者名称显示">
+                        {displayNameOptions.map(option => {
+                          const isActive = options.displayNamePreference === option.value
+                          return (
+                            <button
+                              key={option.value}
+                              type="button"
+                              role="radio"
+                              aria-checked={isActive}
+                              className={`display-name-item ${isActive ? 'active' : ''}`}
+                              onClick={() => setOptions(prev => ({ ...prev, displayNamePreference: option.value }))}
+                            >
+                              <span>{option.label}</span>
+                              <small>{option.desc}</small>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </>
+                  )}
+
+                  {options.format === 'excel' && (
+                    <div className={`dialog-switch-row ${shouldShowDisplayNameSection ? 'nested-row' : ''}`} style={shouldShowDisplayNameSection ? { marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--border-light)' } : {}}>
+                      <div className="dialog-switch-copy">
+                        <h4>导出完整列</h4>
+                        <div className="format-note">
+                          开启后会在 Excel 表格中拆分出「发送者昵称」、「微信ID」、「备注」等列；群聊会额外包含「群昵称」列，私聊不会显示这一列。关闭则只保留紧凑的「发送者身份」。
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className={`dialog-switch ${!options.excelCompactColumns ? 'on' : ''}`}
+                        aria-pressed={!options.excelCompactColumns}
+                        aria-label="切换导出完整列"
+                        onClick={() => setOptions(prev => ({ ...prev, excelCompactColumns: !prev.excelCompactColumns }))}
+                      >
+                        <span className="dialog-switch-thumb" />
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

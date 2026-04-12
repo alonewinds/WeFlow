@@ -13,6 +13,7 @@ export const CONFIG_KEYS = {
   LAST_SESSION: 'lastSession',
   WINDOW_BOUNDS: 'windowBounds',
   CACHE_PATH: 'cachePath',
+  LAUNCH_AT_STARTUP: 'launchAtStartup',
 
   EXPORT_PATH: 'exportPath',
   AGREEMENT_ACCEPTED: 'agreementAccepted',
@@ -29,6 +30,7 @@ export const CONFIG_KEYS = {
   EXPORT_DEFAULT_FORMAT: 'exportDefaultFormat',
   EXPORT_DEFAULT_AVATARS: 'exportDefaultAvatars',
   EXPORT_DEFAULT_DATE_RANGE: 'exportDefaultDateRange',
+  EXPORT_DEFAULT_FILE_NAMING_MODE: 'exportDefaultFileNamingMode',
   EXPORT_DEFAULT_MEDIA: 'exportDefaultMedia',
   EXPORT_DEFAULT_VOICE_AS_TEXT: 'exportDefaultVoiceAsText',
   EXPORT_DEFAULT_EXCEL_COMPACT_COLUMNS: 'exportDefaultExcelCompactColumns',
@@ -58,6 +60,7 @@ export const CONFIG_KEYS = {
 
   // 更新
   IGNORED_UPDATE_VERSION: 'ignoredUpdateVersion',
+  UPDATE_CHANNEL: 'updateChannel',
 
   // 通知
   NOTIFICATION_ENABLED: 'notificationEnabled',
@@ -69,6 +72,8 @@ export const CONFIG_KEYS = {
   HTTP_API_PORT: 'httpApiPort',
   HTTP_API_HOST: 'httpApiHost',
   MESSAGE_PUSH_ENABLED: 'messagePushEnabled',
+  MESSAGE_PUSH_FILTER_MODE: 'messagePushFilterMode',
+  MESSAGE_PUSH_FILTER_LIST: 'messagePushFilterList',
   WINDOW_CLOSE_BEHAVIOR: 'windowCloseBehavior',
   QUOTE_LAYOUT: 'quoteLayout',
 
@@ -77,7 +82,31 @@ export const CONFIG_KEYS = {
 
   // 数据收集
   ANALYTICS_CONSENT: 'analyticsConsent',
-  ANALYTICS_DENY_COUNT: 'analyticsDenyCount'
+  ANALYTICS_DENY_COUNT: 'analyticsDenyCount',
+
+  // AI 见解
+  AI_MODEL_API_BASE_URL: 'aiModelApiBaseUrl',
+  AI_MODEL_API_KEY: 'aiModelApiKey',
+  AI_MODEL_API_MODEL: 'aiModelApiModel',
+  AI_INSIGHT_ENABLED: 'aiInsightEnabled',
+  AI_INSIGHT_API_BASE_URL: 'aiInsightApiBaseUrl',
+  AI_INSIGHT_API_KEY: 'aiInsightApiKey',
+  AI_INSIGHT_API_MODEL: 'aiInsightApiModel',
+  AI_INSIGHT_SILENCE_DAYS: 'aiInsightSilenceDays',
+  AI_INSIGHT_ALLOW_CONTEXT: 'aiInsightAllowContext',
+  AI_INSIGHT_WHITELIST_ENABLED: 'aiInsightWhitelistEnabled',
+  AI_INSIGHT_WHITELIST: 'aiInsightWhitelist',
+  AI_INSIGHT_COOLDOWN_MINUTES: 'aiInsightCooldownMinutes',
+  AI_INSIGHT_SCAN_INTERVAL_HOURS: 'aiInsightScanIntervalHours',
+  AI_INSIGHT_CONTEXT_COUNT: 'aiInsightContextCount',
+  AI_INSIGHT_SYSTEM_PROMPT: 'aiInsightSystemPrompt',
+  AI_INSIGHT_TELEGRAM_ENABLED: 'aiInsightTelegramEnabled',
+  AI_INSIGHT_TELEGRAM_TOKEN: 'aiInsightTelegramToken',
+  AI_INSIGHT_TELEGRAM_CHAT_IDS: 'aiInsightTelegramChatIds',
+
+  // AI 足迹
+  AI_FOOTPRINT_ENABLED: 'aiFootprintEnabled',
+  AI_FOOTPRINT_SYSTEM_PROMPT: 'aiFootprintSystemPrompt'
 } as const
 
 export interface WxidConfig {
@@ -92,16 +121,21 @@ export interface ExportDefaultMediaConfig {
   videos: boolean
   voices: boolean
   emojis: boolean
+  files: boolean
 }
+
+export type ExportFileNamingMode = 'classic' | 'date-range'
 
 export type WindowCloseBehavior = 'ask' | 'tray' | 'quit'
 export type QuoteLayout = 'quote-top' | 'quote-bottom'
+export type UpdateChannel = 'stable' | 'preview' | 'dev'
 
 const DEFAULT_EXPORT_MEDIA_CONFIG: ExportDefaultMediaConfig = {
   images: true,
   videos: true,
   voices: true,
-  emojis: true
+  emojis: true,
+  files: true
 }
 
 // 获取解密密钥
@@ -256,6 +290,18 @@ export async function setLogEnabled(enabled: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.LOG_ENABLED, enabled)
 }
 
+// 获取开机自启动偏好
+export async function getLaunchAtStartup(): Promise<boolean | null> {
+  const value = await config.get(CONFIG_KEYS.LAUNCH_AT_STARTUP)
+  if (typeof value === 'boolean') return value
+  return null
+}
+
+// 设置开机自启动偏好
+export async function setLaunchAtStartup(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.LAUNCH_AT_STARTUP, enabled)
+}
+
 // 获取 LLM 模型路径
 export async function getLlmModelPath(): Promise<string | null> {
   const value = await config.get(CONFIG_KEYS.LLM_MODEL_PATH)
@@ -400,6 +446,18 @@ export async function setExportDefaultDateRange(range: ExportDefaultDateRangeCon
   await config.set(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE, range)
 }
 
+// 获取导出默认文件命名方式
+export async function getExportDefaultFileNamingMode(): Promise<ExportFileNamingMode | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_FILE_NAMING_MODE)
+  if (value === 'classic' || value === 'date-range') return value
+  return null
+}
+
+// 设置导出默认文件命名方式
+export async function setExportDefaultFileNamingMode(mode: ExportFileNamingMode): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_FILE_NAMING_MODE, mode)
+}
+
 // 获取导出默认媒体设置
 export async function getExportDefaultMedia(): Promise<ExportDefaultMediaConfig | null> {
   const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA)
@@ -408,7 +466,8 @@ export async function getExportDefaultMedia(): Promise<ExportDefaultMediaConfig 
       images: value,
       videos: value,
       voices: value,
-      emojis: value
+      emojis: value,
+      files: value
     }
   }
   if (value && typeof value === 'object') {
@@ -417,7 +476,8 @@ export async function getExportDefaultMedia(): Promise<ExportDefaultMediaConfig 
       images: typeof raw.images === 'boolean' ? raw.images : DEFAULT_EXPORT_MEDIA_CONFIG.images,
       videos: typeof raw.videos === 'boolean' ? raw.videos : DEFAULT_EXPORT_MEDIA_CONFIG.videos,
       voices: typeof raw.voices === 'boolean' ? raw.voices : DEFAULT_EXPORT_MEDIA_CONFIG.voices,
-      emojis: typeof raw.emojis === 'boolean' ? raw.emojis : DEFAULT_EXPORT_MEDIA_CONFIG.emojis
+      emojis: typeof raw.emojis === 'boolean' ? raw.emojis : DEFAULT_EXPORT_MEDIA_CONFIG.emojis,
+      files: typeof raw.files === 'boolean' ? raw.files : DEFAULT_EXPORT_MEDIA_CONFIG.files
     }
   }
   return null
@@ -429,7 +489,8 @@ export async function setExportDefaultMedia(media: ExportDefaultMediaConfig): Pr
     images: media.images,
     videos: media.videos,
     voices: media.voices,
-    emojis: media.emojis
+    emojis: media.emojis,
+    files: media.files
   })
 }
 
@@ -1381,6 +1442,18 @@ export async function setIgnoredUpdateVersion(version: string): Promise<void> {
   await config.set(CONFIG_KEYS.IGNORED_UPDATE_VERSION, version)
 }
 
+// 获取更新渠道（空值/auto 视为未显式设置，交由安装包类型决定默认渠道）
+export async function getUpdateChannel(): Promise<UpdateChannel | null> {
+  const value = await config.get(CONFIG_KEYS.UPDATE_CHANNEL)
+  if (value === 'stable' || value === 'preview' || value === 'dev') return value
+  return null
+}
+
+// 设置更新渠道
+export async function setUpdateChannel(channel: UpdateChannel): Promise<void> {
+  await config.set(CONFIG_KEYS.UPDATE_CHANNEL, channel)
+}
+
 // 获取通知开关
 export async function getNotificationEnabled(): Promise<boolean> {
   const value = await config.get(CONFIG_KEYS.NOTIFICATION_ENABLED)
@@ -1432,6 +1505,29 @@ export async function getMessagePushEnabled(): Promise<boolean> {
 
 export async function setMessagePushEnabled(enabled: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.MESSAGE_PUSH_ENABLED, enabled)
+}
+
+export type MessagePushFilterMode = 'all' | 'whitelist' | 'blacklist'
+export type MessagePushSessionType = 'private' | 'group' | 'official' | 'other'
+
+export async function getMessagePushFilterMode(): Promise<MessagePushFilterMode> {
+  const value = await config.get(CONFIG_KEYS.MESSAGE_PUSH_FILTER_MODE)
+  if (value === 'whitelist' || value === 'blacklist') return value
+  return 'all'
+}
+
+export async function setMessagePushFilterMode(mode: MessagePushFilterMode): Promise<void> {
+  await config.set(CONFIG_KEYS.MESSAGE_PUSH_FILTER_MODE, mode)
+}
+
+export async function getMessagePushFilterList(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.MESSAGE_PUSH_FILTER_LIST)
+  return Array.isArray(value) ? value.map(item => String(item || '').trim()).filter(Boolean) : []
+}
+
+export async function setMessagePushFilterList(list: string[]): Promise<void> {
+  const normalized = Array.from(new Set((list || []).map(item => String(item || '').trim()).filter(Boolean)))
+  await config.set(CONFIG_KEYS.MESSAGE_PUSH_FILTER_LIST, normalized)
 }
 
 export async function getWindowCloseBehavior(): Promise<WindowCloseBehavior> {
@@ -1518,4 +1614,192 @@ export async function getHttpApiHost(): Promise<string> {
 
 export async function setHttpApiHost(host: string): Promise<void> {
   await config.set(CONFIG_KEYS.HTTP_API_HOST, host)
+}
+
+// ─── AI 见解 ──────────────────────────────────────────────────────────────────
+
+export async function getAiModelApiBaseUrl(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_MODEL_API_BASE_URL)
+  if (typeof value === 'string' && value.trim()) return value
+  const legacy = await config.get(CONFIG_KEYS.AI_INSIGHT_API_BASE_URL)
+  return typeof legacy === 'string' ? legacy : ''
+}
+
+export async function setAiModelApiBaseUrl(url: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MODEL_API_BASE_URL, url)
+}
+
+export async function getAiModelApiKey(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_MODEL_API_KEY)
+  if (typeof value === 'string' && value.trim()) return value
+  const legacy = await config.get(CONFIG_KEYS.AI_INSIGHT_API_KEY)
+  return typeof legacy === 'string' ? legacy : ''
+}
+
+export async function setAiModelApiKey(key: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MODEL_API_KEY, key)
+}
+
+export async function getAiModelApiModel(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_MODEL_API_MODEL)
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  const legacy = await config.get(CONFIG_KEYS.AI_INSIGHT_API_MODEL)
+  return typeof legacy === 'string' && legacy.trim() ? legacy.trim() : 'gpt-4o-mini'
+}
+
+export async function setAiModelApiModel(model: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MODEL_API_MODEL, model)
+}
+
+export async function getAiInsightEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_ENABLED)
+  return value === true
+}
+
+export async function setAiInsightEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_ENABLED, enabled)
+}
+
+export async function getAiInsightApiBaseUrl(): Promise<string> {
+  return getAiModelApiBaseUrl()
+}
+
+export async function setAiInsightApiBaseUrl(url: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_BASE_URL, url)
+  await setAiModelApiBaseUrl(url)
+}
+
+export async function getAiInsightApiKey(): Promise<string> {
+  return getAiModelApiKey()
+}
+
+export async function setAiInsightApiKey(key: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_KEY, key)
+  await setAiModelApiKey(key)
+}
+
+export async function getAiInsightApiModel(): Promise<string> {
+  return getAiModelApiModel()
+}
+
+export async function setAiInsightApiModel(model: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_API_MODEL, model)
+  await setAiModelApiModel(model)
+}
+
+export async function getAiInsightSilenceDays(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_SILENCE_DAYS)
+  return typeof value === 'number' && value > 0 ? value : 3
+}
+
+export async function setAiInsightSilenceDays(days: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_SILENCE_DAYS, days)
+}
+
+export async function getAiInsightAllowContext(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_ALLOW_CONTEXT)
+  return value === true
+}
+
+export async function setAiInsightAllowContext(allow: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_ALLOW_CONTEXT, allow)
+}
+
+export async function getAiInsightWhitelistEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_WHITELIST_ENABLED)
+  return value === true
+}
+
+export async function setAiInsightWhitelistEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_WHITELIST_ENABLED, enabled)
+}
+
+export async function getAiInsightWhitelist(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_WHITELIST)
+  return Array.isArray(value) ? (value as string[]) : []
+}
+
+export async function setAiInsightWhitelist(list: string[]): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_WHITELIST, list)
+}
+
+export async function getAiInsightCooldownMinutes(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_COOLDOWN_MINUTES)
+  return typeof value === 'number' && value >= 0 ? value : 120
+}
+
+export async function setAiInsightCooldownMinutes(minutes: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_COOLDOWN_MINUTES, minutes)
+}
+
+export async function getAiInsightScanIntervalHours(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_SCAN_INTERVAL_HOURS)
+  return typeof value === 'number' && value > 0 ? value : 4
+}
+
+export async function setAiInsightScanIntervalHours(hours: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_SCAN_INTERVAL_HOURS, hours)
+}
+
+export async function getAiInsightContextCount(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_CONTEXT_COUNT)
+  return typeof value === 'number' && value > 0 ? value : 40
+}
+
+export async function setAiInsightContextCount(count: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_CONTEXT_COUNT, count)
+}
+
+export async function getAiInsightSystemPrompt(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_SYSTEM_PROMPT)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiInsightSystemPrompt(prompt: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_SYSTEM_PROMPT, prompt)
+}
+
+export async function getAiInsightTelegramEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_ENABLED)
+  return value === true
+}
+
+export async function setAiInsightTelegramEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_ENABLED, enabled)
+}
+
+export async function getAiInsightTelegramToken(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_TOKEN)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiInsightTelegramToken(token: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_TOKEN, token)
+}
+
+export async function getAiInsightTelegramChatIds(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_CHAT_IDS)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiInsightTelegramChatIds(chatIds: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_TELEGRAM_CHAT_IDS, chatIds)
+}
+
+export async function getAiFootprintEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_FOOTPRINT_ENABLED)
+  return value === true
+}
+
+export async function setAiFootprintEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_FOOTPRINT_ENABLED, enabled)
+}
+
+export async function getAiFootprintSystemPrompt(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_FOOTPRINT_SYSTEM_PROMPT)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiFootprintSystemPrompt(prompt: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_FOOTPRINT_SYSTEM_PROMPT, prompt)
 }

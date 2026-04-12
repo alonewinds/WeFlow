@@ -15,6 +15,7 @@ export interface ExportDefaultsSettingsPatch {
   format?: string
   avatars?: boolean
   dateRange?: ExportDateRangeSelection
+  fileNamingMode?: configService.ExportFileNamingMode
   media?: configService.ExportDefaultMediaConfig
   voiceAsText?: boolean
   excelCompactColumns?: boolean
@@ -44,6 +45,11 @@ const exportExcelColumnOptions = [
   { value: 'full', label: '完整列', desc: '含发送者昵称/微信ID/备注' }
 ] as const
 
+const exportFileNamingModeOptions: Array<{ value: configService.ExportFileNamingMode; label: string; desc: string }> = [
+  { value: 'classic', label: '简洁模式', desc: '示例：私聊_张三（兼容旧版）' },
+  { value: 'date-range', label: '时间范围模式', desc: '示例：私聊_张三_20250101-20250331（推荐）' }
+]
+
 const exportConcurrencyOptions = [1, 2, 3, 4, 5, 6] as const
 
 const getOptionLabel = (options: ReadonlyArray<{ value: string; label: string }>, value: string) => {
@@ -56,17 +62,21 @@ export function ExportDefaultsSettingsForm({
   layout = 'stacked'
 }: ExportDefaultsSettingsFormProps) {
   const [showExportExcelColumnsSelect, setShowExportExcelColumnsSelect] = useState(false)
+  const [showExportFileNamingModeSelect, setShowExportFileNamingModeSelect] = useState(false)
   const [isExportDateRangeDialogOpen, setIsExportDateRangeDialogOpen] = useState(false)
   const exportExcelColumnsDropdownRef = useRef<HTMLDivElement>(null)
+  const exportFileNamingModeDropdownRef = useRef<HTMLDivElement>(null)
 
   const [exportDefaultFormat, setExportDefaultFormat] = useState('excel')
   const [exportDefaultAvatars, setExportDefaultAvatars] = useState(true)
   const [exportDefaultDateRange, setExportDefaultDateRange] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
+  const [exportDefaultFileNamingMode, setExportDefaultFileNamingMode] = useState<configService.ExportFileNamingMode>('classic')
   const [exportDefaultMedia, setExportDefaultMedia] = useState<configService.ExportDefaultMediaConfig>({
     images: true,
     videos: true,
     voices: true,
-    emojis: true
+    emojis: true,
+    files: true
   })
   const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
   const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
@@ -75,10 +85,11 @@ export function ExportDefaultsSettingsForm({
   useEffect(() => {
     let cancelled = false
     void (async () => {
-      const [savedFormat, savedAvatars, savedDateRange, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedConcurrency] = await Promise.all([
+      const [savedFormat, savedAvatars, savedDateRange, savedFileNamingMode, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedConcurrency] = await Promise.all([
         configService.getExportDefaultFormat(),
         configService.getExportDefaultAvatars(),
         configService.getExportDefaultDateRange(),
+        configService.getExportDefaultFileNamingMode(),
         configService.getExportDefaultMedia(),
         configService.getExportDefaultVoiceAsText(),
         configService.getExportDefaultExcelCompactColumns(),
@@ -90,11 +101,13 @@ export function ExportDefaultsSettingsForm({
       setExportDefaultFormat(savedFormat || 'excel')
       setExportDefaultAvatars(savedAvatars ?? true)
       setExportDefaultDateRange(resolveExportDateRangeConfig(savedDateRange))
+      setExportDefaultFileNamingMode(savedFileNamingMode ?? 'classic')
       setExportDefaultMedia(savedMedia ?? {
         images: true,
         videos: true,
         voices: true,
-        emojis: true
+        emojis: true,
+        files: true
       })
       setExportDefaultVoiceAsText(savedVoiceAsText ?? false)
       setExportDefaultExcelCompactColumns(savedExcelCompactColumns ?? true)
@@ -112,15 +125,19 @@ export function ExportDefaultsSettingsForm({
       if (showExportExcelColumnsSelect && exportExcelColumnsDropdownRef.current && !exportExcelColumnsDropdownRef.current.contains(target)) {
         setShowExportExcelColumnsSelect(false)
       }
+      if (showExportFileNamingModeSelect && exportFileNamingModeDropdownRef.current && !exportFileNamingModeDropdownRef.current.contains(target)) {
+        setShowExportFileNamingModeSelect(false)
+      }
     }
 
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
-  }, [showExportExcelColumnsSelect])
+  }, [showExportExcelColumnsSelect, showExportFileNamingModeSelect])
 
   const exportExcelColumnsValue = exportDefaultExcelCompactColumns ? 'compact' : 'full'
   const exportDateRangeLabel = useMemo(() => getExportDateRangeLabel(exportDefaultDateRange), [exportDefaultDateRange])
   const exportExcelColumnsLabel = useMemo(() => getOptionLabel(exportExcelColumnOptions, exportExcelColumnsValue), [exportExcelColumnsValue])
+  const exportFileNamingModeLabel = useMemo(() => getOptionLabel(exportFileNamingModeOptions, exportDefaultFileNamingMode), [exportDefaultFileNamingMode])
 
   const notify = (text: string, success = true) => {
     onNotify?.(text, success)
@@ -222,6 +239,7 @@ export function ExportDefaultsSettingsForm({
               className={`settings-time-range-trigger ${isExportDateRangeDialogOpen ? 'open' : ''}`}
               onClick={() => {
                 setShowExportExcelColumnsSelect(false)
+                setShowExportFileNamingModeSelect(false)
                 setIsExportDateRangeDialogOpen(true)
               }}
             >
@@ -247,6 +265,50 @@ export function ExportDefaultsSettingsForm({
 
       <div className="form-group">
         <div className="form-copy">
+          <label>导出文件命名方式</label>
+          <span className="form-hint">控制导出文件名是否包含时间范围</span>
+        </div>
+        <div className="form-control">
+          <div className="select-field" ref={exportFileNamingModeDropdownRef}>
+            <button
+              type="button"
+              className={`select-trigger ${showExportFileNamingModeSelect ? 'open' : ''}`}
+              onClick={() => {
+                setShowExportFileNamingModeSelect(!showExportFileNamingModeSelect)
+                setShowExportExcelColumnsSelect(false)
+                setIsExportDateRangeDialogOpen(false)
+              }}
+            >
+              <span className="select-value">{exportFileNamingModeLabel}</span>
+              <ChevronDown size={16} />
+            </button>
+            {showExportFileNamingModeSelect && (
+              <div className="select-dropdown">
+                {exportFileNamingModeOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={`select-option ${exportDefaultFileNamingMode === option.value ? 'active' : ''}`}
+                    onClick={async () => {
+                      setExportDefaultFileNamingMode(option.value)
+                      await configService.setExportDefaultFileNamingMode(option.value)
+                      onDefaultsChanged?.({ fileNamingMode: option.value })
+                      notify('已更新导出文件命名方式', true)
+                      setShowExportFileNamingModeSelect(false)
+                    }}
+                  >
+                    <span className="option-label">{option.label}</span>
+                    <span className="option-desc">{option.desc}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="form-group">
+        <div className="form-copy">
           <label>Excel 列显示</label>
           <span className="form-hint">控制 Excel 导出的列字段</span>
         </div>
@@ -257,6 +319,7 @@ export function ExportDefaultsSettingsForm({
               className={`select-trigger ${showExportExcelColumnsSelect ? 'open' : ''}`}
               onClick={() => {
                 setShowExportExcelColumnsSelect(!showExportExcelColumnsSelect)
+                setShowExportFileNamingModeSelect(false)
                 setIsExportDateRangeDialogOpen(false)
               }}
             >
@@ -292,7 +355,7 @@ export function ExportDefaultsSettingsForm({
       <div className="form-group media-setting-group">
         <div className="form-copy">
           <label>默认导出媒体内容</label>
-          <span className="form-hint">控制图片、视频、语音、表情包的默认导出开关</span>
+          <span className="form-hint">控制图片、视频、语音、表情包、文件的默认导出开关</span>
         </div>
         <div className="form-control">
           <div className="media-default-grid">
@@ -351,6 +414,20 @@ export function ExportDefaultsSettingsForm({
                 }}
               />
               表情包
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={exportDefaultMedia.files}
+                onChange={async (e) => {
+                  const next = { ...exportDefaultMedia, files: e.target.checked }
+                  setExportDefaultMedia(next)
+                  await configService.setExportDefaultMedia(next)
+                  onDefaultsChanged?.({ media: next })
+                  notify(`已${e.target.checked ? '开启' : '关闭'}默认导出文件`, true)
+                }}
+              />
+              文件
             </label>
           </div>
         </div>

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { Home, MessageSquare, BarChart3, FileText, Settings, Download, Aperture, UserCircle, Lock, LockOpen, ChevronUp, RefreshCw } from 'lucide-react'
+import { Home, MessageSquare, BarChart3, FileText, Settings, Download, Aperture, UserCircle, Lock, LockOpen, ChevronUp, RefreshCw, FolderClosed, Footprints } from 'lucide-react'
 import { useAppStore } from '../stores/appStore'
 import { useChatStore } from '../stores/chatStore'
 import { useAnalyticsStore } from '../stores/analyticsStore'
@@ -429,6 +429,16 @@ function Sidebar({ collapsed }: SidebarProps) {
             <span className="nav-label">通讯录</span>
           </NavLink>
 
+          {/* 资源浏览 */}
+          <NavLink
+            to="/resources"
+            className={`nav-item ${isActive('/resources') ? 'active' : ''}`}
+            title={collapsed ? '资源浏览' : undefined}
+          >
+            <span className="nav-icon"><FolderClosed size={20} /></span>
+            <span className="nav-label">资源浏览</span>
+          </NavLink>
+
           {/* 聊天分析 */}
           <NavLink
             to="/analytics"
@@ -447,6 +457,16 @@ function Sidebar({ collapsed }: SidebarProps) {
           >
             <span className="nav-icon"><FileText size={20} /></span>
             <span className="nav-label">年度报告</span>
+          </NavLink>
+
+          {/* 我的足迹 */}
+          <NavLink
+            to="/footprint"
+            className={`nav-item ${isActive('/footprint') ? 'active' : ''}`}
+            title={collapsed ? '我的足迹' : undefined}
+          >
+            <span className="nav-icon"><Footprints size={20} /></span>
+            <span className="nav-label">我的足迹</span>
           </NavLink>
 
           {/* 导出 */}

@@ -80,7 +80,7 @@ export class WcdbService {
         // Worker 退出，需要 reject 所有 pending promises
         if (code !== 0) {
           console.error('WCDB Worker 异常退出，退出码:', code)
-          const errorMsg = `Worker 异常退出 (退出码: ${code})。可能是 DLL 加载失败，请检查是否安装了 Visual C++ Redistributable。`
+          const errorMsg = `Worker 异常退出 (退出码: ${code})。可能是数据服务加载失败，请检查是否安装了 Visual C++ Redistributable。`
           for (const [id, p] of this.pending) {
             p.reject(new Error(errorMsg))
           }
@@ -268,6 +268,37 @@ export class WcdbService {
     return this.callWorker('getMessagesByType', { sessionId, localType, ascending, limit, offset })
   }
 
+  async getMediaStream(options?: {
+    sessionId?: string
+    mediaType?: 'image' | 'video' | 'all'
+    beginTimestamp?: number
+    endTimestamp?: number
+    limit?: number
+    offset?: number
+  }): Promise<{
+    success: boolean
+    items?: Array<{
+      sessionId: string
+      sessionDisplayName?: string
+      mediaType: 'image' | 'video'
+      localId: number
+      serverId?: string
+      createTime: number
+      localType: number
+      senderUsername?: string
+      isSend?: number | null
+      imageMd5?: string
+      imageDatName?: string
+      videoMd5?: string
+      content?: string
+    }>
+    hasMore?: boolean
+    nextOffset?: number
+    error?: string
+  }> {
+    return this.callWorker('getMediaStream', { options })
+  }
+
   /**
    * 获取联系人昵称
    */
@@ -417,6 +448,19 @@ export class WcdbService {
     return this.callWorker('getGroupStats', { chatroomId, beginTimestamp, endTimestamp })
   }
 
+  async getMyFootprintStats(options: {
+    beginTimestamp?: number
+    endTimestamp?: number
+    myWxid?: string
+    privateSessionIds?: string[]
+    groupSessionIds?: string[]
+    mentionLimit?: number
+    privateLimit?: number
+    mentionMode?: 'text_at_me' | string
+  }): Promise<{ success: boolean; data?: any; error?: string }> {
+    return this.callWorker('getMyFootprintStats', { options })
+  }
+
   /**
    * 打开消息游标
    */
@@ -467,7 +511,7 @@ export class WcdbService {
   }
 
   /**
-   * 获取表情包释义（严格 DLL 接口）
+   * 获取表情包释义（严格数据服务接口）
    */
   async getEmoticonCaptionStrict(md5: string): Promise<{ success: boolean; caption?: string; error?: string }> {
     return this.callWorker('getEmoticonCaptionStrict', { md5 })
@@ -561,6 +605,24 @@ export class WcdbService {
     return this.callWorker('getSnsExportStats', { myWxid })
   }
 
+  async checkMessageAntiRevokeTriggers(
+    sessionIds: string[]
+  ): Promise<{ success: boolean; rows?: Array<{ sessionId: string; success: boolean; installed?: boolean; error?: string }>; error?: string }> {
+    return this.callWorker('checkMessageAntiRevokeTriggers', { sessionIds })
+  }
+
+  async installMessageAntiRevokeTriggers(
+    sessionIds: string[]
+  ): Promise<{ success: boolean; rows?: Array<{ sessionId: string; success: boolean; alreadyInstalled?: boolean; error?: string }>; error?: string }> {
+    return this.callWorker('installMessageAntiRevokeTriggers', { sessionIds })
+  }
+
+  async uninstallMessageAntiRevokeTriggers(
+    sessionIds: string[]
+  ): Promise<{ success: boolean; rows?: Array<{ sessionId: string; success: boolean; error?: string }>; error?: string }> {
+    return this.callWorker('uninstallMessageAntiRevokeTriggers', { sessionIds })
+  }
+
   /**
    * 安装朋友圈删除拦截
    */
@@ -590,7 +652,7 @@ export class WcdbService {
   }
 
   /**
-   * 获取 DLL 内部日志
+   * 获取数据服务内部日志
    */
   async getLogs(): Promise<{ success: boolean; logs?: string[]; error?: string }> {
     return this.callWorker('getLogs')

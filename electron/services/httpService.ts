@@ -6,12 +6,14 @@ import * as http from 'http'
 import * as fs from 'fs'
 import * as path from 'path'
 import { URL } from 'url'
+import { timingSafeEqual } from 'crypto'
 import { chatService, Message } from './chatService'
 import { wcdbService } from './wcdbService'
 import { ConfigService } from './config'
 import { videoService } from './videoService'
 import { imageDecryptService } from './imageDecryptService'
 import { groupAnalyticsService } from './groupAnalyticsService'
+import { snsService } from './snsService'
 
 // ChatLab 格式定义
 interface ChatLabHeader {
@@ -267,9 +269,19 @@ class HttpService {
      */
     private async parseBody(req: http.IncomingMessage): Promise<Record<string, any>> {
         if (req.method !== 'POST') return {}
+        const MAX_BODY_SIZE = 10 * 1024 * 1024 // 10MB
         return new Promise((resolve) => {
             let body = ''
-            req.on('data', chunk => { body += chunk.toString() })
+            let bodySize = 0
+            req.on('data', chunk => {
+                bodySize += chunk.length
+                if (bodySize > MAX_BODY_SIZE) {
+                    req.destroy()
+                    resolve({})
+                    return
+                }
+                body += chunk.toString()
+            })
             req.on('end', () => {
                 try {
                     resolve(JSON.parse(body))
@@ -284,31 +296,45 @@ class HttpService {
     /**
      * 鉴权拦截器
      */
+    private safeEqual(a: string, b: string): boolean {
+        const bufA = Buffer.from(a)
+        const bufB = Buffer.from(b)
+        if (bufA.length !== bufB.length) return false
+        return timingSafeEqual(bufA, bufB)
+    }
+
     private verifyToken(req: http.IncomingMessage, url: URL, body: Record<string, any>): boolean {
         const expectedToken = String(this.configService.get('httpApiToken') || '').trim()
-        if (!expectedToken) return true
+        if (!expectedToken) {
+            // token 未配置时拒绝所有请求，防止未授权访问
+            console.warn('[HttpService] Access denied: httpApiToken not configured')
+            return false
+        }
 
         const authHeader = req.headers.authorization
         if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
             const token = authHeader.substring(7).trim()
-            if (token === expectedToken) return true
+            if (this.safeEqual(token, expectedToken)) return true
         }
 
         const queryToken = url.searchParams.get('access_token')
-        if (queryToken && queryToken.trim() === expectedToken) return true
+        if (queryToken && this.safeEqual(queryToken.trim(), expectedToken)) return true
 
         const bodyToken = body['access_token']
-        return !!(bodyToken && String(bodyToken).trim() === expectedToken);
-
-
+        return !!(bodyToken && this.safeEqual(String(bodyToken).trim(), expectedToken))
     }
 
     /**
      * 处理 HTTP 请求 (重构后)
      */
     private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-        res.setHeader('Access-Control-Allow-Origin', '*')
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        // 仅允许本地来源的跨域请求
+        const origin = req.headers.origin || ''
+        if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+            res.setHeader('Access-Control-Allow-Origin', origin)
+            res.setHeader('Vary', 'Origin')
+        }
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
 
         if (req.method === 'OPTIONS') {
@@ -348,6 +374,33 @@ class HttpService {
                 await this.handleContacts(url, res)
             } else if (pathname === '/api/v1/group-members') {
                 await this.handleGroupMembers(url, res)
+            } else if (pathname === '/api/v1/sns/timeline') {
+                if (req.method !== 'GET') return this.sendMethodNotAllowed(res, 'GET')
+                await this.handleSnsTimeline(url, res)
+            } else if (pathname === '/api/v1/sns/usernames') {
+                if (req.method !== 'GET') return this.sendMethodNotAllowed(res, 'GET')
+                await this.handleSnsUsernames(res)
+            } else if (pathname === '/api/v1/sns/export/stats') {
+                if (req.method !== 'GET') return this.sendMethodNotAllowed(res, 'GET')
+                await this.handleSnsExportStats(url, res)
+            } else if (pathname === '/api/v1/sns/media/proxy') {
+                if (req.method !== 'GET') return this.sendMethodNotAllowed(res, 'GET')
+                await this.handleSnsMediaProxy(url, res)
+            } else if (pathname === '/api/v1/sns/export') {
+                if (req.method !== 'POST') return this.sendMethodNotAllowed(res, 'POST')
+                await this.handleSnsExport(url, res)
+            } else if (pathname === '/api/v1/sns/block-delete/status') {
+                if (req.method !== 'GET') return this.sendMethodNotAllowed(res, 'GET')
+                await this.handleSnsBlockDeleteStatus(res)
+            } else if (pathname === '/api/v1/sns/block-delete/install') {
+                if (req.method !== 'POST') return this.sendMethodNotAllowed(res, 'POST')
+                await this.handleSnsBlockDeleteInstall(res)
+            } else if (pathname === '/api/v1/sns/block-delete/uninstall') {
+                if (req.method !== 'POST') return this.sendMethodNotAllowed(res, 'POST')
+                await this.handleSnsBlockDeleteUninstall(res)
+            } else if (pathname.startsWith('/api/v1/sns/post/')) {
+                if (req.method !== 'DELETE') return this.sendMethodNotAllowed(res, 'DELETE')
+                await this.handleSnsDeletePost(pathname, res)
             } else if (pathname.startsWith('/api/v1/media/')) {
                 this.handleMediaRequest(pathname, res)
             } else {
@@ -403,9 +456,15 @@ class HttpService {
   }
 
   private handleMediaRequest(pathname: string, res: http.ServerResponse): void {
-    const mediaBasePath = this.getApiMediaExportPath()
+    const mediaBasePath = path.resolve(this.getApiMediaExportPath())
     const relativePath = pathname.replace('/api/v1/media/', '')
-    const fullPath = path.join(mediaBasePath, relativePath)
+    const fullPath = path.resolve(mediaBasePath, relativePath)
+
+    // 防止路径穿越攻击
+    if (!fullPath.startsWith(mediaBasePath + path.sep) && fullPath !== mediaBasePath) {
+      this.sendError(res, 403, 'Forbidden')
+      return
+    }
 
     if (!fs.existsSync(fullPath)) {
       this.sendError(res, 404, 'Media not found')
@@ -557,6 +616,15 @@ class HttpService {
       if (['0', 'false', 'no', 'off'].includes(normalized)) return false
     }
     return defaultValue
+  }
+
+  private parseStringListParam(value: string | null): string[] | undefined {
+    if (!value) return undefined
+    const values = value
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+    return values.length > 0 ? Array.from(new Set(values)) : undefined
   }
 
   private parseMediaOptions(url: URL): ApiMediaOptions {
@@ -788,6 +856,313 @@ class HttpService {
     } catch (error) {
       this.sendError(res, 500, String(error))
     }
+  }
+
+  private async handleSnsTimeline(url: URL, res: http.ServerResponse): Promise<void> {
+    const limit = this.parseIntParam(url.searchParams.get('limit'), 20, 1, 200)
+    const offset = this.parseIntParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER)
+    const usernames = this.parseStringListParam(url.searchParams.get('usernames'))
+    const keyword = (url.searchParams.get('keyword') || '').trim() || undefined
+    const resolveMedia = this.parseBooleanParam(url, ['media', 'resolveMedia', 'meiti'], true)
+    const inlineMedia = resolveMedia && this.parseBooleanParam(url, ['inline'], false)
+    const replaceMedia = resolveMedia && this.parseBooleanParam(url, ['replace'], true)
+    const startTimeRaw = this.parseTimeParam(url.searchParams.get('start'))
+    const endTimeRaw = this.parseTimeParam(url.searchParams.get('end'), true)
+    const startTime = startTimeRaw > 0 ? startTimeRaw : undefined
+    const endTime = endTimeRaw > 0 ? endTimeRaw : undefined
+
+    const result = await snsService.getTimeline(limit, offset, usernames, keyword, startTime, endTime)
+    if (!result.success) {
+      this.sendError(res, 500, result.error || 'Failed to get sns timeline')
+      return
+    }
+
+    let timeline = result.timeline || []
+    if (resolveMedia && timeline.length > 0) {
+      timeline = await this.enrichSnsTimelineMedia(timeline, inlineMedia, replaceMedia)
+    }
+
+    this.sendJson(res, {
+      success: true,
+      count: timeline.length,
+      timeline
+    })
+  }
+
+  private async handleSnsUsernames(res: http.ServerResponse): Promise<void> {
+    const result = await snsService.getSnsUsernames()
+    if (!result.success) {
+      this.sendError(res, 500, result.error || 'Failed to get sns usernames')
+      return
+    }
+    this.sendJson(res, {
+      success: true,
+      usernames: result.usernames || []
+    })
+  }
+
+  private async handleSnsExportStats(url: URL, res: http.ServerResponse): Promise<void> {
+    const fast = this.parseBooleanParam(url, ['fast'], false)
+    const result = fast
+      ? await snsService.getExportStatsFast()
+      : await snsService.getExportStats()
+    if (!result.success) {
+      this.sendError(res, 500, result.error || 'Failed to get sns export stats')
+      return
+    }
+    this.sendJson(res, result)
+  }
+
+  private async handleSnsMediaProxy(url: URL, res: http.ServerResponse): Promise<void> {
+    const mediaUrl = (url.searchParams.get('url') || '').trim()
+    if (!mediaUrl) {
+      this.sendError(res, 400, 'Missing required parameter: url')
+      return
+    }
+
+    const key = this.toSnsMediaKey(url.searchParams.get('key'))
+    const result = await snsService.downloadImage(mediaUrl, key)
+    if (!result.success) {
+      this.sendError(res, 502, result.error || 'Failed to proxy sns media')
+      return
+    }
+
+    if (result.data) {
+      res.setHeader('Content-Type', result.contentType || 'application/octet-stream')
+      res.setHeader('Content-Length', result.data.length)
+      res.writeHead(200)
+      res.end(result.data)
+      return
+    }
+
+    if (result.cachePath && fs.existsSync(result.cachePath)) {
+      try {
+        const stat = fs.statSync(result.cachePath)
+        res.setHeader('Content-Type', result.contentType || 'application/octet-stream')
+        res.setHeader('Content-Length', stat.size)
+        res.writeHead(200)
+
+        const stream = fs.createReadStream(result.cachePath)
+        stream.on('error', () => {
+          if (!res.headersSent) {
+            this.sendError(res, 500, 'Failed to read proxied sns media')
+          } else {
+            try { res.destroy() } catch {}
+          }
+        })
+        stream.pipe(res)
+        return
+      } catch (error) {
+        console.error('[HttpService] Failed to stream sns media cache:', error)
+      }
+    }
+
+    this.sendError(res, 502, result.error || 'Failed to proxy sns media')
+  }
+
+  private async handleSnsExport(url: URL, res: http.ServerResponse): Promise<void> {
+    const outputDir = String(url.searchParams.get('outputDir') || '').trim()
+    if (!outputDir) {
+      this.sendError(res, 400, 'Missing required field: outputDir')
+      return
+    }
+
+    const rawFormat = String(url.searchParams.get('format') || 'json').trim().toLowerCase()
+    const format = rawFormat === 'arkme-json' ? 'arkmejson' : rawFormat
+    if (!['json', 'html', 'arkmejson'].includes(format)) {
+      this.sendError(res, 400, 'Invalid format, supported: json/html/arkmejson')
+      return
+    }
+
+    const usernames = this.parseStringListParam(url.searchParams.get('usernames'))
+    const keyword = String(url.searchParams.get('keyword') || '').trim() || undefined
+    const startTimeRaw = this.parseTimeParam(url.searchParams.get('start'))
+    const endTimeRaw = this.parseTimeParam(url.searchParams.get('end'), true)
+
+    const options: {
+      outputDir: string
+      format: 'json' | 'html' | 'arkmejson'
+      usernames?: string[]
+      keyword?: string
+      exportMedia?: boolean
+      exportImages?: boolean
+      exportLivePhotos?: boolean
+      exportVideos?: boolean
+      startTime?: number
+      endTime?: number
+    } = {
+      outputDir,
+      format: format as 'json' | 'html' | 'arkmejson',
+      usernames,
+      keyword,
+      exportMedia: this.parseBooleanParam(url, ['exportMedia'], false)
+    }
+
+    if (url.searchParams.has('exportImages')) options.exportImages = this.parseBooleanParam(url, ['exportImages'], false)
+    if (url.searchParams.has('exportLivePhotos')) options.exportLivePhotos = this.parseBooleanParam(url, ['exportLivePhotos'], false)
+    if (url.searchParams.has('exportVideos')) options.exportVideos = this.parseBooleanParam(url, ['exportVideos'], false)
+    if (startTimeRaw > 0) options.startTime = startTimeRaw
+    if (endTimeRaw > 0) options.endTime = endTimeRaw
+
+    const result = await snsService.exportTimeline(options)
+    if (!result.success) {
+      this.sendError(res, 500, result.error || 'Failed to export sns timeline')
+      return
+    }
+    this.sendJson(res, result)
+  }
+
+  private async handleSnsBlockDeleteStatus(res: http.ServerResponse): Promise<void> {
+    const result = await snsService.checkSnsBlockDeleteTrigger()
+    if (!result.success) {
+      this.sendError(res, 500, result.error || 'Failed to check sns block-delete status')
+      return
+    }
+    this.sendJson(res, result)
+  }
+
+  private async handleSnsBlockDeleteInstall(res: http.ServerResponse): Promise<void> {
+    const result = await snsService.installSnsBlockDeleteTrigger()
+    if (!result.success) {
+      this.sendError(res, 500, result.error || 'Failed to install sns block-delete trigger')
+      return
+    }
+    this.sendJson(res, result)
+  }
+
+  private async handleSnsBlockDeleteUninstall(res: http.ServerResponse): Promise<void> {
+    const result = await snsService.uninstallSnsBlockDeleteTrigger()
+    if (!result.success) {
+      this.sendError(res, 500, result.error || 'Failed to uninstall sns block-delete trigger')
+      return
+    }
+    this.sendJson(res, result)
+  }
+
+  private async handleSnsDeletePost(pathname: string, res: http.ServerResponse): Promise<void> {
+    const postId = decodeURIComponent(pathname.replace('/api/v1/sns/post/', '')).trim()
+    if (!postId) {
+      this.sendError(res, 400, 'Missing required path parameter: postId')
+      return
+    }
+
+    const result = await snsService.deleteSnsPost(postId)
+    if (!result.success) {
+      this.sendError(res, 500, result.error || 'Failed to delete sns post')
+      return
+    }
+    this.sendJson(res, result)
+  }
+
+  private toSnsMediaKey(value: unknown): string | number | undefined {
+    if (value == null) return undefined
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    const text = String(value).trim()
+    if (!text) return undefined
+    if (/^-?\d+$/.test(text)) return Number(text)
+    return text
+  }
+
+  private buildSnsMediaProxyUrl(rawUrl: string, key?: string | number): string | undefined {
+    const target = String(rawUrl || '').trim()
+    if (!target) return undefined
+    const params = new URLSearchParams({ url: target })
+    if (key !== undefined) params.set('key', String(key))
+    return `http://${this.host}:${this.port}/api/v1/sns/media/proxy?${params.toString()}`
+  }
+
+  private async resolveSnsMediaUrl(
+    rawUrl: string,
+    key: string | number | undefined,
+    inline: boolean
+  ): Promise<{ resolvedUrl?: string; proxyUrl?: string }> {
+    const proxyUrl = this.buildSnsMediaProxyUrl(rawUrl, key)
+    if (!proxyUrl) return {}
+    if (!inline) return { resolvedUrl: proxyUrl, proxyUrl }
+
+    try {
+      const resolved = await snsService.proxyImage(rawUrl, key)
+      if (resolved.success && resolved.dataUrl) {
+        return { resolvedUrl: resolved.dataUrl, proxyUrl }
+      }
+    } catch (error) {
+      console.warn('[HttpService] resolveSnsMediaUrl inline failed:', error)
+    }
+
+    return { resolvedUrl: proxyUrl, proxyUrl }
+  }
+
+  private async enrichSnsTimelineMedia(posts: any[], inline: boolean, replace: boolean): Promise<any[]> {
+    return Promise.all(
+      (posts || []).map(async (post) => {
+        const mediaList = Array.isArray(post?.media) ? post.media : []
+        if (mediaList.length === 0) return post
+
+        const nextMedia = await Promise.all(
+          mediaList.map(async (media: any) => {
+            const rawUrl = typeof media?.url === 'string' ? media.url : ''
+            const rawThumb = typeof media?.thumb === 'string' ? media.thumb : ''
+            const mediaKey = this.toSnsMediaKey(media?.key)
+
+            const [urlResolved, thumbResolved] = await Promise.all([
+              this.resolveSnsMediaUrl(rawUrl, mediaKey, inline),
+              this.resolveSnsMediaUrl(rawThumb, mediaKey, inline)
+            ])
+
+            const nextItem: any = {
+              ...media,
+              rawUrl,
+              rawThumb,
+              resolvedUrl: urlResolved.resolvedUrl,
+              resolvedThumbUrl: thumbResolved.resolvedUrl,
+              proxyUrl: urlResolved.proxyUrl,
+              proxyThumbUrl: thumbResolved.proxyUrl
+            }
+
+            if (replace) {
+              nextItem.url = urlResolved.resolvedUrl || rawUrl
+              nextItem.thumb = thumbResolved.resolvedUrl || rawThumb
+            }
+
+            if (media?.livePhoto && typeof media.livePhoto === 'object') {
+              const livePhoto = media.livePhoto
+              const rawLiveUrl = typeof livePhoto.url === 'string' ? livePhoto.url : ''
+              const rawLiveThumb = typeof livePhoto.thumb === 'string' ? livePhoto.thumb : ''
+              const liveKey = this.toSnsMediaKey(livePhoto.key ?? mediaKey)
+
+              const [liveUrlResolved, liveThumbResolved] = await Promise.all([
+                this.resolveSnsMediaUrl(rawLiveUrl, liveKey, inline),
+                this.resolveSnsMediaUrl(rawLiveThumb, liveKey, inline)
+              ])
+
+              const nextLive: any = {
+                ...livePhoto,
+                rawUrl: rawLiveUrl,
+                rawThumb: rawLiveThumb,
+                resolvedUrl: liveUrlResolved.resolvedUrl,
+                resolvedThumbUrl: liveThumbResolved.resolvedUrl,
+                proxyUrl: liveUrlResolved.proxyUrl,
+                proxyThumbUrl: liveThumbResolved.proxyUrl
+              }
+
+              if (replace) {
+                nextLive.url = liveUrlResolved.resolvedUrl || rawLiveUrl
+                nextLive.thumb = liveThumbResolved.resolvedUrl || rawLiveThumb
+              }
+
+              nextItem.livePhoto = nextLive
+            }
+
+            return nextItem
+          })
+        )
+
+        return {
+          ...post,
+          media: nextMedia
+        }
+      })
+    )
   }
 
   private getApiMediaExportPath(): string {
@@ -1449,6 +1824,11 @@ class HttpService {
     res.setHeader('Content-Type', 'application/json; charset=utf-8')
     res.writeHead(200)
     res.end(JSON.stringify(data, null, 2))
+  }
+
+  private sendMethodNotAllowed(res: http.ServerResponse, allow: string): void {
+    res.setHeader('Allow', allow)
+    this.sendError(res, 405, `Method Not Allowed. Allowed: ${allow}`)
   }
 
   /**

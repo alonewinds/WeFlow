@@ -17,10 +17,13 @@ import AgreementPage from './pages/AgreementPage'
 import GroupAnalyticsPage from './pages/GroupAnalyticsPage'
 import SettingsPage from './pages/SettingsPage'
 import ExportPage from './pages/ExportPage'
+import MyFootprintPage from './pages/MyFootprintPage'
 import VideoWindow from './pages/VideoWindow'
 import ImageWindow from './pages/ImageWindow'
 import SnsPage from './pages/SnsPage'
+import BizPage from './pages/BizPage'
 import ContactsPage from './pages/ContactsPage'
+import ResourcesPage from './pages/ResourcesPage'
 import ChatHistoryPage from './pages/ChatHistoryPage'
 import NotificationWindow from './pages/NotificationWindow'
 
@@ -103,44 +106,7 @@ function App() {
 
   // 数据收集同意状态
   const [showAnalyticsConsent, setShowAnalyticsConsent] = useState(false)
-
-  const [showWaylandWarning, setShowWaylandWarning] = useState(false)
-
-  useEffect(() => {
-    const checkWaylandStatus = async () => {
-      try {
-        // 防止在非客户端环境报错，先检查 API 是否存在
-        if (!window.electronAPI?.app?.checkWayland) return
-
-        // 通过 configService 检查是否已经弹过窗
-        const hasWarned = await window.electronAPI.config.get('waylandWarningShown')
-
-        if (!hasWarned) {
-          const isWayland = await window.electronAPI.app.checkWayland()
-          if (isWayland) {
-            setShowWaylandWarning(true)
-          }
-        }
-      } catch (e) {
-        console.error('检查 Wayland 状态失败:', e)
-      }
-    }
-
-    // 只有在协议同意之后并且已经进入主应用流程才检查
-    if (!isAgreementWindow && !isOnboardingWindow && !agreementLoading) {
-      checkWaylandStatus()
-    }
-  }, [isAgreementWindow, isOnboardingWindow, agreementLoading])
-
-  const handleDismissWaylandWarning = async () => {
-    try {
-      // 记录到本地配置中，下次不再提示
-      await window.electronAPI.config.set('waylandWarningShown', true)
-    } catch (e) {
-      console.error('保存 Wayland 提示状态失败:', e)
-    }
-    setShowWaylandWarning(false)
-  }
+  const [analyticsConsent, setAnalyticsConsent] = useState<boolean | null>(null)
 
   useEffect(() => {
     if (location.pathname !== '/settings') {
@@ -252,6 +218,7 @@ function App() {
           // 协议已同意，检查数据收集同意状态
           const consent = await configService.getAnalyticsConsent()
           const denyCount = await configService.getAnalyticsDenyCount()
+          setAnalyticsConsent(consent)
           // 如果未设置同意状态且拒绝次数小于2次，显示弹窗
           if (consent === null && denyCount < 2) {
             setShowAnalyticsConsent(true)
@@ -266,18 +233,21 @@ function App() {
     checkAgreement()
   }, [])
 
-  // 初始化数据收集
+  // 初始化数据收集（仅在用户同意后）
   useEffect(() => {
-    cloudControl.initCloudControl()
-  }, [])
+    if (analyticsConsent === true) {
+      cloudControl.initCloudControl()
+    }
+  }, [analyticsConsent])
 
-  // 记录页面访问
+  // 记录页面访问（仅在用户同意后）
   useEffect(() => {
+    if (analyticsConsent !== true) return
     const path = location.pathname
     if (path && path !== '/') {
       cloudControl.recordPage(path)
     }
-  }, [location.pathname])
+  }, [location.pathname, analyticsConsent])
 
   const handleAgree = async () => {
     if (!agreementChecked) return
@@ -296,6 +266,7 @@ function App() {
 
   const handleAnalyticsAllow = async () => {
     await configService.setAnalyticsConsent(true)
+    setAnalyticsConsent(true)
     setShowAnalyticsConsent(false)
   }
 
@@ -312,10 +283,14 @@ function App() {
     const removeUpdateListener = window.electronAPI?.app?.onUpdateAvailable?.((info: any) => {
       // 发现新版本时保存更新信息，锁定状态下不弹窗，解锁后再显示
       if (info) {
-        setUpdateInfo({ ...info, hasUpdate: true })
-        if (!useAppStore.getState().isLocked) {
-          setShowUpdateDialog(true)
-        }
+        window.electronAPI.app.getVersion().then((currentVersion: string) => {
+          const isMandatory = !!(info.minimumVersion && currentVersion &&
+            currentVersion.localeCompare(info.minimumVersion, undefined, { numeric: true, sensitivity: 'base' }) <= 0)
+          setUpdateInfo({ ...info, hasUpdate: true, isMandatory })
+          if (!useAppStore.getState().isLocked) {
+            setShowUpdateDialog(true)
+          }
+        })
       }
     })
     const removeProgressListener = window.electronAPI?.app?.onDownloadProgress?.((progress: any) => {
@@ -326,6 +301,21 @@ function App() {
       removeProgressListener?.()
     }
   }, [setUpdateInfo, setDownloadProgress, setShowUpdateDialog, isNotificationWindow])
+
+  // 监听通知点击导航事件
+  useEffect(() => {
+    if (isNotificationWindow) return
+
+    const removeListener = window.electronAPI?.notification?.onNavigateToSession?.((sessionId: string) => {
+      if (!sessionId) return
+      // 导航到聊天页面，通过URL参数让ChatPage接收sessionId
+      navigate(`/chat?sessionId=${encodeURIComponent(sessionId)}`, { replace: true })
+    })
+
+    return () => {
+      removeListener?.()
+    }
+  }, [navigate, isNotificationWindow])
 
   // 解锁后显示暂存的更新弹窗
   useEffect(() => {
@@ -419,7 +409,7 @@ function App() {
             }
           } else {
 
-            // 如果错误信息包含 VC++ 或 DLL 相关内容，不清除配置，只提示用户
+            // 如果错误信息包含 VC++ 或数据服务相关内容，不清除配置，只提示用户
             // 其他错误可能需要重新配置
             const errorMsg = result.error || ''
             if (errorMsg.includes('Visual C++') ||
@@ -580,9 +570,13 @@ function App() {
               <div className="agreement-notice">
                 <strong>这是免费软件，如果你是付费购买的话请骂死那个骗子。</strong>
                 <span className="agreement-notice-link">
-                  我们唯一的官方网站：
+                  官方网站：
+                  <a href="https://weflow.top" target="_blank" rel="noreferrer">
+                    https://weflow.top
+                  </a>
+                  &nbsp;·&nbsp;
                   <a href="https://github.com/hicccc77/WeFlow" target="_blank" rel="noreferrer">
-                    https://github.com/hicccc77/WeFlow
+                    GitHub 仓库
                   </a>
                 </span>
               </div>
@@ -597,7 +591,7 @@ function App() {
                 <p>因使用本软件产生的任何直接或间接损失，开发者不承担任何责任。请确保你的使用行为符合当地法律法规。</p>
 
                 <h4>4. 隐私保护</h4>
-                <p>本软件不收集任何用户数据。软件更新检测仅获取版本信息，不涉及任何个人隐私。</p>
+                <p>本软件不收集任何用户隐私数据。软件更新检测仅获取版本信息，不涉及任何个人隐私。</p>
               </div>
             </div>
             <div className="agreement-footer">
@@ -654,41 +648,15 @@ function App() {
         </div>
       )}
 
-      {showWaylandWarning && (
-          <div className="agreement-overlay">
-            <div className="agreement-modal">
-              <div className="agreement-header">
-                <Shield size={32} />
-                <h2>环境兼容性提示 (Wayland)</h2>
-              </div>
-              <div className="agreement-content">
-                <div className="agreement-text">
-                  <p>检测到您当前正在使用 <strong>Wayland</strong> 显示服务器。</p>
-                  <p>在 Wayland 环境下，出于系统级的安全与设计机制，<strong>应用程序无法直接控制新弹出窗口的位置</strong>。</p>
-                  <p>这可能导致某些独立窗口（如消息通知、图片查看器等）出现位置随机、或不受控制的情况。这是底层机制导致的，对此我们无能为力。</p>
-                  <br />
-                  <p>如果您觉得窗口位置异常严重影响了使用体验，建议尝试：</p>
-                  <p>1. 在系统登录界面，将会话切换回 <strong>X11 (Xorg)</strong> 模式。</p>
-                  <p>2. 修改您的桌面管理器 (WM/DE) 配置，强制指定该应用程序的窗口规则。</p>
-                </div>
-              </div>
-              <div className="agreement-footer">
-                <div className="agreement-actions">
-                  <button className="btn btn-primary" onClick={handleDismissWaylandWarning}>我知道了，不再提示</button>
-                </div>
-              </div>
-            </div>
-          </div>
-      )}
-
       {/* 更新提示对话框 */}
       <UpdateDialog
         open={showUpdateDialog}
         updateInfo={updateInfo}
-        onClose={() => setShowUpdateDialog(false)}
+        onClose={() => { if (!(updateInfo as any)?.isMandatory) setShowUpdateDialog(false) }}
         onUpdate={handleUpdateNow}
         onIgnore={handleIgnoreUpdate}
         isDownloading={isDownloading}
+        isMandatory={!!(updateInfo as any)?.isMandatory}
         progress={downloadProgress}
       />
 
@@ -722,10 +690,13 @@ function App() {
               <Route path="/annual-report/view" element={<AnnualReportWindow />} />
               <Route path="/dual-report" element={<DualReportPage />} />
               <Route path="/dual-report/view" element={<DualReportWindow />} />
+              <Route path="/footprint" element={<MyFootprintPage />} />
 
               <Route path="/export" element={<div className="export-route-anchor" aria-hidden="true" />} />
               <Route path="/sns" element={<SnsPage />} />
+              <Route path="/biz" element={<BizPage />} />
               <Route path="/contacts" element={<ContactsPage />} />
+              <Route path="/resources" element={<ResourcesPage />} />
               <Route path="/chat-history/:sessionId/:messageId" element={<ChatHistoryPage />} />
               <Route path="/chat-history-inline/:payloadId" element={<ChatHistoryPage />} />
             </Routes>

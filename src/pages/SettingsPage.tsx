@@ -6,28 +6,51 @@ import { useThemeStore, themes } from '../stores/themeStore'
 import { useAnalyticsStore } from '../stores/analyticsStore'
 import { dialog } from '../services/ipc'
 import * as configService from '../services/config'
+import type { ContactInfo } from '../types/models'
 import {
   Eye, EyeOff, FolderSearch, FolderOpen, Search, Copy,
   RotateCcw, Trash2, Plug, Check, Sun, Moon, Monitor,
   Palette, Database, HardDrive, Info, RefreshCw, ChevronDown, Download, Mic,
-  ShieldCheck, Fingerprint, Lock, KeyRound, Bell, Globe, BarChart2, X, UserRound
+  ShieldCheck, Fingerprint, Lock, KeyRound, Bell, Globe, BarChart2, X, UserRound,
+  Sparkles, Loader2, CheckCircle2, XCircle
 } from 'lucide-react'
 import { Avatar } from '../components/Avatar'
 import './SettingsPage.scss'
 
-type SettingsTab = 'appearance' | 'notification' | 'database' | 'models' | 'cache' | 'api' | 'security' | 'about' | 'analytics'
+type SettingsTab =
+  | 'appearance'
+  | 'notification'
+  | 'antiRevoke'
+  | 'database'
+  | 'models'
+  | 'cache'
+  | 'api'
+  | 'updates'
+  | 'security'
+  | 'about'
+  | 'analytics'
+  | 'aiCommon'
+  | 'insight'
+  | 'aiFootprint'
 
-const tabs: { id: SettingsTab; label: string; icon: React.ElementType }[] = [
+const tabs: { id: Exclude<SettingsTab, 'insight' | 'aiFootprint'>; label: string; icon: React.ElementType }[] = [
   { id: 'appearance', label: '外观', icon: Palette },
   { id: 'notification', label: '通知', icon: Bell },
+  { id: 'antiRevoke', label: '防撤回', icon: RotateCcw },
   { id: 'database', label: '数据库连接', icon: Database },
   { id: 'models', label: '模型管理', icon: Mic },
   { id: 'cache', label: '缓存', icon: HardDrive },
   { id: 'api', label: 'API 服务', icon: Globe },
-
   { id: 'analytics', label: '分析', icon: BarChart2 },
   { id: 'security', label: '安全', icon: ShieldCheck },
+  { id: 'updates', label: '版本更新', icon: RefreshCw },
   { id: 'about', label: '关于', icon: Info }
+]
+
+const aiTabs: Array<{ id: Extract<SettingsTab, 'aiCommon' | 'insight' | 'aiFootprint'>; label: string }> = [
+  { id: 'aiCommon', label: 'AI 通用' },
+  { id: 'insight', label: 'AI 见解' },
+  { id: 'aiFootprint', label: 'AI 足迹' }
 ]
 
 const isMac = navigator.userAgent.toLowerCase().includes('mac')
@@ -49,6 +72,25 @@ interface WxidOption {
   avatarUrl?: string
 }
 
+type SessionFilterType = configService.MessagePushSessionType
+type SessionFilterTypeValue = 'all' | SessionFilterType
+type SessionFilterMode = 'all' | 'whitelist' | 'blacklist'
+
+interface SessionFilterOption {
+  username: string
+  displayName: string
+  avatarUrl?: string
+  type: SessionFilterType
+}
+
+const sessionFilterTypeOptions: Array<{ value: SessionFilterTypeValue; label: string }> = [
+  { value: 'all', label: '全部' },
+  { value: 'private', label: '私聊' },
+  { value: 'group', label: '群聊' },
+  { value: 'official', label: '订阅号/服务号' },
+  { value: 'other', label: '其他/非好友' }
+]
+
 interface SettingsPageProps {
   onClose?: () => void
 }
@@ -68,9 +110,10 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     setDownloadProgress,
     showUpdateDialog,
     setShowUpdateDialog,
-    setUpdateError
   } = useAppStore()
 
+  const chatSessions = useChatStore((state) => state.sessions)
+  const setChatSessions = useChatStore((state) => state.setSessions)
   const resetChatStore = useChatStore((state) => state.reset)
   const { currentTheme, themeMode, setTheme, setThemeMode } = useThemeStore()
   const [systemDark, setSystemDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches)
@@ -84,6 +127,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const clearAnalyticsStoreCache = useAnalyticsStore((state) => state.clearCache)
 
   const [activeTab, setActiveTab] = useState<SettingsTab>('appearance')
+  const [aiGroupExpanded, setAiGroupExpanded] = useState(false)
   const [decryptKey, setDecryptKey] = useState('')
   const [imageXorKey, setImageXorKey] = useState('')
   const [imageAesKey, setImageAesKey] = useState('')
@@ -139,9 +183,14 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [notificationPosition, setNotificationPosition] = useState<'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center'>('top-right')
   const [notificationFilterMode, setNotificationFilterMode] = useState<'all' | 'whitelist' | 'blacklist'>('all')
   const [notificationFilterList, setNotificationFilterList] = useState<string[]>([])
+  const [launchAtStartup, setLaunchAtStartup] = useState(false)
+  const [launchAtStartupSupported, setLaunchAtStartupSupported] = useState(isWindows || isMac)
+  const [launchAtStartupReason, setLaunchAtStartupReason] = useState('')
   const [windowCloseBehavior, setWindowCloseBehavior] = useState<configService.WindowCloseBehavior>('ask')
   const [quoteLayout, setQuoteLayout] = useState<configService.QuoteLayout>('quote-top')
+  const [updateChannel, setUpdateChannel] = useState<configService.UpdateChannel>('stable')
   const [filterSearchKeyword, setFilterSearchKeyword] = useState('')
+  const [notificationTypeFilter, setNotificationTypeFilter] = useState<SessionFilterTypeValue>('all')
   const [filterModeDropdownOpen, setFilterModeDropdownOpen] = useState(false)
   const [positionDropdownOpen, setPositionDropdownOpen] = useState(false)
   const [closeBehaviorDropdownOpen, setCloseBehaviorDropdownOpen] = useState(false)
@@ -162,6 +211,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [isFetchingDbKey, setIsFetchingDbKey] = useState(false)
   const [isFetchingImageKey, setIsFetchingImageKey] = useState(false)
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
+  const [isUpdatingLaunchAtStartup, setIsUpdatingLaunchAtStartup] = useState(false)
   const [appVersion, setAppVersion] = useState('')
   const [message, setMessage] = useState<{ text: string; success: boolean } | null>(null)
   const [showDecryptKey, setShowDecryptKey] = useState(false)
@@ -196,25 +246,46 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [isTogglingApi, setIsTogglingApi] = useState(false)
   const [showApiWarning, setShowApiWarning] = useState(false)
   const [messagePushEnabled, setMessagePushEnabled] = useState(false)
+  const [messagePushFilterMode, setMessagePushFilterMode] = useState<configService.MessagePushFilterMode>('all')
+  const [messagePushFilterList, setMessagePushFilterList] = useState<string[]>([])
+  const [messagePushFilterDropdownOpen, setMessagePushFilterDropdownOpen] = useState(false)
+  const [messagePushFilterSearchKeyword, setMessagePushFilterSearchKeyword] = useState('')
+  const [messagePushTypeFilter, setMessagePushTypeFilter] = useState<SessionFilterTypeValue>('all')
+  const [messagePushContactOptions, setMessagePushContactOptions] = useState<ContactInfo[]>([])
+  const [antiRevokeSearchKeyword, setAntiRevokeSearchKeyword] = useState('')
+  const [antiRevokeSelectedIds, setAntiRevokeSelectedIds] = useState<Set<string>>(new Set())
+  const [antiRevokeStatusMap, setAntiRevokeStatusMap] = useState<Record<string, { installed?: boolean; loading?: boolean; error?: string }>>({})
+  const [isAntiRevokeRefreshing, setIsAntiRevokeRefreshing] = useState(false)
+  const [isAntiRevokeInstalling, setIsAntiRevokeInstalling] = useState(false)
+  const [isAntiRevokeUninstalling, setIsAntiRevokeUninstalling] = useState(false)
+  const [antiRevokeSummary, setAntiRevokeSummary] = useState<{ action: 'refresh' | 'install' | 'uninstall'; success: number; failed: number } | null>(null)
 
   const isClearingCache = isClearingAnalyticsCache || isClearingImageCache || isClearingAllCache
 
-  const [isWayland, setIsWayland] = useState(false)
-  useEffect(() => {
-    const checkWaylandStatus = async () => {
-      if (window.electronAPI?.app?.checkWayland) {
-        try {
-          const wayland = await window.electronAPI.app.checkWayland()
-          setIsWayland(wayland)
-        } catch (e) {
-          console.error('检查 Wayland 状态失败:', e)
-        }
-      }
-    }
-    checkWaylandStatus()
-  }, [])
-
-
+  // AI 见解 state
+  const [aiInsightEnabled, setAiInsightEnabled] = useState(false)
+  const [aiModelApiBaseUrl, setAiModelApiBaseUrl] = useState('')
+  const [aiModelApiKey, setAiModelApiKey] = useState('')
+  const [aiModelApiModel, setAiModelApiModel] = useState('gpt-4o-mini')
+  const [aiInsightSilenceDays, setAiInsightSilenceDays] = useState(3)
+  const [aiInsightAllowContext, setAiInsightAllowContext] = useState(false)
+  const [isTestingInsight, setIsTestingInsight] = useState(false)
+  const [insightTestResult, setInsightTestResult] = useState<{ success: boolean; message: string } | null>(null)
+  const [showInsightApiKey, setShowInsightApiKey] = useState(false)
+  const [isTriggeringInsightTest, setIsTriggeringInsightTest] = useState(false)
+  const [insightTriggerResult, setInsightTriggerResult] = useState<{ success: boolean; message: string } | null>(null)
+  const [aiInsightWhitelistEnabled, setAiInsightWhitelistEnabled] = useState(false)
+  const [aiInsightWhitelist, setAiInsightWhitelist] = useState<Set<string>>(new Set())
+  const [insightWhitelistSearch, setInsightWhitelistSearch] = useState('')
+  const [aiInsightCooldownMinutes, setAiInsightCooldownMinutes] = useState(120)
+  const [aiInsightScanIntervalHours, setAiInsightScanIntervalHours] = useState(4)
+  const [aiInsightContextCount, setAiInsightContextCount] = useState(40)
+  const [aiInsightSystemPrompt, setAiInsightSystemPrompt] = useState('')
+  const [aiInsightTelegramEnabled, setAiInsightTelegramEnabled] = useState(false)
+  const [aiInsightTelegramToken, setAiInsightTelegramToken] = useState('')
+  const [aiInsightTelegramChatIds, setAiInsightTelegramChatIds] = useState('')
+  const [aiFootprintEnabled, setAiFootprintEnabled] = useState(false)
+  const [aiFootprintSystemPrompt, setAiFootprintSystemPrompt] = useState('')
 
   // 检查 Hello 可用性
   useEffect(() => {
@@ -253,6 +324,12 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     if (!initialTab) return
     setActiveTab(initialTab)
   }, [location.state])
+
+  useEffect(() => {
+    if (activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint') {
+      setAiGroupExpanded(true)
+    }
+  }, [activeTab])
 
   useEffect(() => {
     if (!onClose) return
@@ -306,15 +383,16 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         setFilterModeDropdownOpen(false)
         setPositionDropdownOpen(false)
         setCloseBehaviorDropdownOpen(false)
+        setMessagePushFilterDropdownOpen(false)
       }
     }
-    if (filterModeDropdownOpen || positionDropdownOpen || closeBehaviorDropdownOpen) {
+    if (filterModeDropdownOpen || positionDropdownOpen || closeBehaviorDropdownOpen || messagePushFilterDropdownOpen) {
       document.addEventListener('click', handleClickOutside)
     }
     return () => {
       document.removeEventListener('click', handleClickOutside)
     }
-  }, [closeBehaviorDropdownOpen, filterModeDropdownOpen, positionDropdownOpen])
+  }, [closeBehaviorDropdownOpen, filterModeDropdownOpen, messagePushFilterDropdownOpen, positionDropdownOpen])
 
 
   const loadConfig = async () => {
@@ -337,8 +415,13 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const savedNotificationFilterMode = await configService.getNotificationFilterMode()
       const savedNotificationFilterList = await configService.getNotificationFilterList()
       const savedMessagePushEnabled = await configService.getMessagePushEnabled()
+      const savedMessagePushFilterMode = await configService.getMessagePushFilterMode()
+      const savedMessagePushFilterList = await configService.getMessagePushFilterList()
+      const contactsResult = await window.electronAPI.chat.getContacts({ lite: true })
+      const savedLaunchAtStartupStatus = await window.electronAPI.app.getLaunchAtStartupStatus()
       const savedWindowCloseBehavior = await configService.getWindowCloseBehavior()
       const savedQuoteLayout = await configService.getQuoteLayout()
+      const savedUpdateChannel = await configService.getUpdateChannel()
 
       const savedAuthEnabled = await window.electronAPI.auth.verifyEnabled()
       const savedAuthUseHello = await configService.getAuthUseHello()
@@ -385,8 +468,28 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       setNotificationFilterMode(savedNotificationFilterMode)
       setNotificationFilterList(savedNotificationFilterList)
       setMessagePushEnabled(savedMessagePushEnabled)
+      setMessagePushFilterMode(savedMessagePushFilterMode)
+      setMessagePushFilterList(savedMessagePushFilterList)
+      if (contactsResult.success && Array.isArray(contactsResult.contacts)) {
+        setMessagePushContactOptions(contactsResult.contacts as ContactInfo[])
+      }
+      setLaunchAtStartup(savedLaunchAtStartupStatus.enabled)
+      setLaunchAtStartupSupported(savedLaunchAtStartupStatus.supported)
+      setLaunchAtStartupReason(savedLaunchAtStartupStatus.reason || '')
       setWindowCloseBehavior(savedWindowCloseBehavior)
       setQuoteLayout(savedQuoteLayout)
+      if (savedUpdateChannel) {
+        setUpdateChannel(savedUpdateChannel)
+      } else {
+        const currentVersion = await window.electronAPI.app.getVersion()
+        if (/^0\.\d{2}\.\d+$/i.test(currentVersion) || /-preview\.\d+\.\d+$/i.test(currentVersion)) {
+          setUpdateChannel('preview')
+        } else if (/^\d{2}\.\d{1,2}\.\d{1,2}$/i.test(currentVersion) || /-dev\.\d+\.\d+\.\d+$/i.test(currentVersion) || /(alpha|beta|rc)/i.test(currentVersion)) {
+          setUpdateChannel('dev')
+        } else {
+          setUpdateChannel('stable')
+        }
+      }
 
       const savedExcludeWords = await configService.getWordCloudExcludeWords()
       setWordCloudExcludeWords(savedExcludeWords)
@@ -407,6 +510,41 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
       if (savedWhisperModelDir) setWhisperModelDir(savedWhisperModelDir)
 
+      // 加载 AI 见解配置
+      const savedAiInsightEnabled = await configService.getAiInsightEnabled()
+      const savedAiModelApiBaseUrl = await configService.getAiModelApiBaseUrl()
+      const savedAiModelApiKey = await configService.getAiModelApiKey()
+      const savedAiModelApiModel = await configService.getAiModelApiModel()
+      const savedAiInsightSilenceDays = await configService.getAiInsightSilenceDays()
+  const savedAiInsightAllowContext = await configService.getAiInsightAllowContext()
+  const savedAiInsightWhitelistEnabled = await configService.getAiInsightWhitelistEnabled()
+  const savedAiInsightWhitelist = await configService.getAiInsightWhitelist()
+  const savedAiInsightCooldownMinutes = await configService.getAiInsightCooldownMinutes()
+  const savedAiInsightScanIntervalHours = await configService.getAiInsightScanIntervalHours()
+  const savedAiInsightContextCount = await configService.getAiInsightContextCount()
+  const savedAiInsightSystemPrompt = await configService.getAiInsightSystemPrompt()
+  const savedAiInsightTelegramEnabled = await configService.getAiInsightTelegramEnabled()
+  const savedAiInsightTelegramToken = await configService.getAiInsightTelegramToken()
+  const savedAiInsightTelegramChatIds = await configService.getAiInsightTelegramChatIds()
+  const savedAiFootprintEnabled = await configService.getAiFootprintEnabled()
+  const savedAiFootprintSystemPrompt = await configService.getAiFootprintSystemPrompt()
+  setAiInsightEnabled(savedAiInsightEnabled)
+  setAiModelApiBaseUrl(savedAiModelApiBaseUrl)
+  setAiModelApiKey(savedAiModelApiKey)
+  setAiModelApiModel(savedAiModelApiModel)
+  setAiInsightSilenceDays(savedAiInsightSilenceDays)
+  setAiInsightAllowContext(savedAiInsightAllowContext)
+  setAiInsightWhitelistEnabled(savedAiInsightWhitelistEnabled)
+  setAiInsightWhitelist(new Set(savedAiInsightWhitelist))
+  setAiInsightCooldownMinutes(savedAiInsightCooldownMinutes)
+  setAiInsightScanIntervalHours(savedAiInsightScanIntervalHours)
+  setAiInsightContextCount(savedAiInsightContextCount)
+  setAiInsightSystemPrompt(savedAiInsightSystemPrompt)
+  setAiInsightTelegramEnabled(savedAiInsightTelegramEnabled)
+  setAiInsightTelegramToken(savedAiInsightTelegramToken)
+  setAiInsightTelegramChatIds(savedAiInsightTelegramChatIds)
+  setAiFootprintEnabled(savedAiFootprintEnabled)
+  setAiFootprintSystemPrompt(savedAiFootprintSystemPrompt)
 
     } catch (e: any) {
       console.error('加载配置失败:', e)
@@ -414,6 +552,29 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   }
 
 
+
+  const handleLaunchAtStartupChange = async (enabled: boolean) => {
+    if (isUpdatingLaunchAtStartup) return
+
+    try {
+      setIsUpdatingLaunchAtStartup(true)
+      const result = await window.electronAPI.app.setLaunchAtStartup(enabled)
+      setLaunchAtStartup(result.enabled)
+      setLaunchAtStartupSupported(result.supported)
+      setLaunchAtStartupReason(result.reason || '')
+
+      if (result.success) {
+        showMessage(enabled ? '已开启开机自启动' : '已关闭开机自启动', true)
+        return
+      }
+
+      showMessage(result.error || result.reason || '设置开机自启动失败', false)
+    } catch (e: any) {
+      showMessage(`设置开机自启动失败: ${e?.message || String(e)}`, false)
+    } finally {
+      setIsUpdatingLaunchAtStartup(false)
+    }
+  }
 
   const refreshWhisperStatus = async (modelDirValue = whisperModelDir) => {
     try {
@@ -512,7 +673,22 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     }
   }
 
+  const handleUpdateChannelChange = async (channel: configService.UpdateChannel) => {
+    if (channel === updateChannel) return
 
+    try {
+      setUpdateChannel(channel)
+      await configService.setUpdateChannel(channel)
+      await configService.setIgnoredUpdateVersion('')
+      setUpdateInfo(null)
+      setShowUpdateDialog(false)
+      const channelLabel = channel === 'stable' ? '稳定版' : channel === 'preview' ? '预览版' : '开发版'
+      showMessage(`已切换到${channelLabel}更新渠道，正在检查更新`, true)
+      await handleCheckUpdate()
+    } catch (e: any) {
+      showMessage(`切换更新渠道失败: ${e}`, false)
+    }
+  }
 
   const showMessage = (text: string, success: boolean) => {
     setMessage({ text, success })
@@ -526,6 +702,251 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       onClose()
     }, 200)
   }
+
+  const normalizeSessionIds = (sessionIds: string[]): string[] =>
+    Array.from(new Set((sessionIds || []).map((id) => String(id || '').trim()).filter(Boolean)))
+
+  const getCurrentAntiRevokeSessionIds = (): string[] =>
+    normalizeSessionIds(chatSessions.map((session) => session.username))
+
+  const ensureAntiRevokeSessionsLoaded = async (): Promise<string[]> => {
+    const current = getCurrentAntiRevokeSessionIds()
+    if (current.length > 0) return current
+    const sessionsResult = await window.electronAPI.chat.getSessions()
+    if (!sessionsResult.success || !sessionsResult.sessions) {
+      throw new Error(sessionsResult.error || '加载会话失败')
+    }
+    setChatSessions(sessionsResult.sessions)
+    return normalizeSessionIds(sessionsResult.sessions.map((session) => session.username))
+  }
+
+  const markAntiRevokeRowsLoading = (sessionIds: string[]) => {
+    setAntiRevokeStatusMap((prev) => {
+      const next = { ...prev }
+      for (const sessionId of sessionIds) {
+        next[sessionId] = {
+          ...(next[sessionId] || {}),
+          loading: true,
+          error: undefined
+        }
+      }
+      return next
+    })
+  }
+
+  const handleRefreshAntiRevokeStatus = async (sessionIds?: string[]) => {
+    if (isAntiRevokeRefreshing || isAntiRevokeInstalling || isAntiRevokeUninstalling) return
+    setAntiRevokeSummary(null)
+    setIsAntiRevokeRefreshing(true)
+    try {
+      const targetIds = normalizeSessionIds(
+        sessionIds && sessionIds.length > 0
+          ? sessionIds
+          : await ensureAntiRevokeSessionsLoaded()
+      )
+      if (targetIds.length === 0) {
+        setAntiRevokeStatusMap({})
+        showMessage('暂无可检查的会话', true)
+        return
+      }
+      markAntiRevokeRowsLoading(targetIds)
+
+      const result = await window.electronAPI.chat.checkAntiRevokeTriggers(targetIds)
+      if (!result.success || !result.rows) {
+        const errorText = result.error || '防撤回状态检查失败'
+        setAntiRevokeStatusMap((prev) => {
+          const next = { ...prev }
+          for (const sessionId of targetIds) {
+            next[sessionId] = {
+              ...(next[sessionId] || {}),
+              loading: false,
+              error: errorText
+            }
+          }
+          return next
+        })
+        showMessage(errorText, false)
+        return
+      }
+
+      const rowMap = new Map<string, { sessionId: string; success: boolean; installed?: boolean; error?: string }>()
+      for (const row of result.rows || []) {
+        const sessionId = String(row.sessionId || '').trim()
+        if (!sessionId) continue
+        rowMap.set(sessionId, row)
+      }
+      const mergedRows = targetIds.map((sessionId) => (
+        rowMap.get(sessionId) || { sessionId, success: false, error: '状态查询未返回结果' }
+      ))
+      const successCount = mergedRows.filter((row) => row.success).length
+      const failedCount = mergedRows.length - successCount
+      setAntiRevokeStatusMap((prev) => {
+        const next = { ...prev }
+        for (const row of mergedRows) {
+          const sessionId = String(row.sessionId || '').trim()
+          if (!sessionId) continue
+          next[sessionId] = {
+            installed: row.installed === true,
+            loading: false,
+            error: row.success ? undefined : (row.error || '状态查询失败')
+          }
+        }
+        return next
+      })
+      setAntiRevokeSummary({ action: 'refresh', success: successCount, failed: failedCount })
+      showMessage(`状态刷新完成：成功 ${successCount}，失败 ${failedCount}`, failedCount === 0)
+    } catch (e: any) {
+      showMessage(`防撤回状态刷新失败: ${e?.message || String(e)}`, false)
+    } finally {
+      setIsAntiRevokeRefreshing(false)
+    }
+  }
+
+  const handleInstallAntiRevokeTriggers = async () => {
+    if (isAntiRevokeRefreshing || isAntiRevokeInstalling || isAntiRevokeUninstalling) return
+    const sessionIds = normalizeSessionIds(Array.from(antiRevokeSelectedIds))
+    if (sessionIds.length === 0) {
+      showMessage('请先选择至少一个会话', false)
+      return
+    }
+    setAntiRevokeSummary(null)
+    setIsAntiRevokeInstalling(true)
+    try {
+      markAntiRevokeRowsLoading(sessionIds)
+      const result = await window.electronAPI.chat.installAntiRevokeTriggers(sessionIds)
+      if (!result.success || !result.rows) {
+        const errorText = result.error || '批量安装失败'
+        setAntiRevokeStatusMap((prev) => {
+          const next = { ...prev }
+          for (const sessionId of sessionIds) {
+            next[sessionId] = {
+              ...(next[sessionId] || {}),
+              loading: false,
+              error: errorText
+            }
+          }
+          return next
+        })
+        showMessage(errorText, false)
+        return
+      }
+
+      const rowMap = new Map<string, { sessionId: string; success: boolean; alreadyInstalled?: boolean; error?: string }>()
+      for (const row of result.rows || []) {
+        const sessionId = String(row.sessionId || '').trim()
+        if (!sessionId) continue
+        rowMap.set(sessionId, row)
+      }
+      const mergedRows = sessionIds.map((sessionId) => (
+        rowMap.get(sessionId) || { sessionId, success: false, error: '安装未返回结果' }
+      ))
+      const successCount = mergedRows.filter((row) => row.success).length
+      const failedCount = mergedRows.length - successCount
+      setAntiRevokeStatusMap((prev) => {
+        const next = { ...prev }
+        for (const row of mergedRows) {
+          const sessionId = String(row.sessionId || '').trim()
+          if (!sessionId) continue
+          next[sessionId] = {
+            installed: row.success ? true : next[sessionId]?.installed,
+            loading: false,
+            error: row.success ? undefined : (row.error || '安装失败')
+          }
+        }
+        return next
+      })
+      setAntiRevokeSummary({ action: 'install', success: successCount, failed: failedCount })
+      showMessage(`批量安装完成：成功 ${successCount}，失败 ${failedCount}`, failedCount === 0)
+    } catch (e: any) {
+      showMessage(`批量安装失败: ${e?.message || String(e)}`, false)
+    } finally {
+      setIsAntiRevokeInstalling(false)
+    }
+  }
+
+  const handleUninstallAntiRevokeTriggers = async () => {
+    if (isAntiRevokeRefreshing || isAntiRevokeInstalling || isAntiRevokeUninstalling) return
+    const sessionIds = normalizeSessionIds(Array.from(antiRevokeSelectedIds))
+    if (sessionIds.length === 0) {
+      showMessage('请先选择至少一个会话', false)
+      return
+    }
+    setAntiRevokeSummary(null)
+    setIsAntiRevokeUninstalling(true)
+    try {
+      markAntiRevokeRowsLoading(sessionIds)
+      const result = await window.electronAPI.chat.uninstallAntiRevokeTriggers(sessionIds)
+      if (!result.success || !result.rows) {
+        const errorText = result.error || '批量卸载失败'
+        setAntiRevokeStatusMap((prev) => {
+          const next = { ...prev }
+          for (const sessionId of sessionIds) {
+            next[sessionId] = {
+              ...(next[sessionId] || {}),
+              loading: false,
+              error: errorText
+            }
+          }
+          return next
+        })
+        showMessage(errorText, false)
+        return
+      }
+
+      const rowMap = new Map<string, { sessionId: string; success: boolean; error?: string }>()
+      for (const row of result.rows || []) {
+        const sessionId = String(row.sessionId || '').trim()
+        if (!sessionId) continue
+        rowMap.set(sessionId, row)
+      }
+      const mergedRows = sessionIds.map((sessionId) => (
+        rowMap.get(sessionId) || { sessionId, success: false, error: '卸载未返回结果' }
+      ))
+      const successCount = mergedRows.filter((row) => row.success).length
+      const failedCount = mergedRows.length - successCount
+      setAntiRevokeStatusMap((prev) => {
+        const next = { ...prev }
+        for (const row of mergedRows) {
+          const sessionId = String(row.sessionId || '').trim()
+          if (!sessionId) continue
+          next[sessionId] = {
+            installed: row.success ? false : next[sessionId]?.installed,
+            loading: false,
+            error: row.success ? undefined : (row.error || '卸载失败')
+          }
+        }
+        return next
+      })
+      setAntiRevokeSummary({ action: 'uninstall', success: successCount, failed: failedCount })
+      showMessage(`批量卸载完成：成功 ${successCount}，失败 ${failedCount}`, failedCount === 0)
+    } catch (e: any) {
+      showMessage(`批量卸载失败: ${e?.message || String(e)}`, false)
+    } finally {
+      setIsAntiRevokeUninstalling(false)
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab !== 'antiRevoke' && activeTab !== 'insight') return
+    let canceled = false
+    ;(async () => {
+      try {
+        // 两个 Tab 都需要会话列表；antiRevoke 还需要额外检查防撤回状态
+        const sessionIds = await ensureAntiRevokeSessionsLoaded()
+        if (canceled) return
+        if (activeTab === 'antiRevoke') {
+          await handleRefreshAntiRevokeStatus(sessionIds)
+        }
+      } catch (e: any) {
+        if (!canceled) {
+          showMessage(`加载会话失败: ${e?.message || String(e)}`, false)
+        }
+      }
+    })()
+    return () => {
+      canceled = true
+    }
+  }, [activeTab])
 
   type WxidKeys = {
     decryptKey: string
@@ -801,7 +1222,13 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         const keysOverride = buildKeysFromInputs({ decryptKey: result.key })
         await handleScanWxid(true, { preferCurrentKeys: true, showDialog: false, keysOverride })
       } else {
-        if (result.error?.includes('未找到微信安装路径') || result.error?.includes('启动微信失败')) {
+        if (
+          result.error?.includes('未找到微信安装路径') ||
+          result.error?.includes('启动微信失败') ||
+          result.error?.includes('未能自动启动微信') ||
+          result.error?.includes('未找到微信进程') ||
+          result.error?.includes('微信进程未运行')
+        ) {
           setIsManualStartPrompt(true)
           setDbKeyStatus('需要手动启动微信')
         } else {
@@ -1104,13 +1531,11 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
             {
               value: 'quote-top' as const,
               label: '引用在上',
-              description: '更接近当前 WeFlow 风格',
               successMessage: '已切换为引用在上样式'
             },
             {
               value: 'quote-bottom' as const,
               label: '正文在上',
-              description: '更接近微信 / 密语风格',
               successMessage: '已切换为正文在上样式'
             }
           ].map(option => {
@@ -1160,12 +1585,44 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 <div className="quote-layout-card-footer">
                   <div className="quote-layout-card-title-group">
                     <span className="quote-layout-card-title">{option.label}</span>
-                    <span className="quote-layout-card-desc">{option.description}</span>
                   </div>
                 </div>
               </button>
             )
           })}
+        </div>
+      </div>
+
+      <div className="divider" />
+
+      <div className="form-group">
+        <label>开机自启动</label>
+        <span className="form-hint">
+          {launchAtStartupSupported
+            ? '开启后，登录系统时会自动启动 WeFlow。'
+            : launchAtStartupReason || '当前环境暂不支持开机自启动。'}
+        </span>
+        <div className="log-toggle-line">
+          <span className="log-status">
+            {isUpdatingLaunchAtStartup
+              ? '保存中...'
+              : launchAtStartupSupported
+                ? (launchAtStartup ? '已开启' : '已关闭')
+                : '当前不可用'}
+          </span>
+          <label className="switch" htmlFor="launch-at-startup-toggle">
+            <input
+              id="launch-at-startup-toggle"
+              className="switch-input"
+              type="checkbox"
+              checked={launchAtStartup}
+              disabled={!launchAtStartupSupported || isUpdatingLaunchAtStartup}
+              onChange={(e) => {
+                void handleLaunchAtStartupChange(e.target.checked)
+              }}
+            />
+            <span className="switch-slider" />
+          </label>
         </div>
       </div>
 
@@ -1227,17 +1684,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   )
 
   const renderNotificationTab = () => {
-    const { sessions } = useChatStore.getState()
-
-    // 获取已过滤会话的信息
-    const getSessionInfo = (username: string) => {
-      const session = sessions.find(s => s.username === username)
-      return {
-        displayName: session?.displayName || username,
-        avatarUrl: session?.avatarUrl || ''
-      }
-    }
-
     // 添加会话到过滤列表
     const handleAddToFilterList = async (username: string) => {
       if (notificationFilterList.includes(username)) return
@@ -1254,18 +1700,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       await configService.setNotificationFilterList(newList)
       showMessage('已从过滤列表移除', true)
     }
-
-    // 过滤掉已在列表中的会话，并根据搜索关键字过滤
-    const availableSessions = sessions.filter(s => {
-      if (notificationFilterList.includes(s.username)) return false
-      if (filterSearchKeyword) {
-        const keyword = filterSearchKeyword.toLowerCase()
-        const displayName = (s.displayName || '').toLowerCase()
-        const username = s.username.toLowerCase()
-        return displayName.includes(keyword) || username.includes(keyword)
-      }
-      return true
-    })
 
     return (
       <div className="tab-content">
@@ -1295,11 +1729,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         <div className="form-group">
           <label>通知显示位置</label>
           <span className="form-hint">选择通知弹窗在屏幕上的显示位置</span>
-          {isWayland && (
-              <span className="form-hint" style={{ color: '#ff4d4f', marginTop: '4px', display: 'block' }}>
-              ⚠️ 注意：Wayland 环境下该配置可能无效！
-            </span>
-          )}
           <div className="custom-select">
             <div
               className={`custom-select-trigger ${positionDropdownOpen ? 'open' : ''}`}
@@ -1363,17 +1792,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 <div
                   key={option.value}
                   className={`custom-select-option ${notificationFilterMode === option.value ? 'selected' : ''}`}
-                  onClick={async () => {
-                    const val = option.value as 'all' | 'whitelist' | 'blacklist'
-                    setNotificationFilterMode(val)
-                    setFilterModeDropdownOpen(false)
-                    await configService.setNotificationFilterMode(val)
-                    showMessage(
-                      val === 'all' ? '已设为接收所有通知' :
-                        val === 'whitelist' ? '已设为仅接收白名单通知' : '已设为屏蔽黑名单通知',
-                      true
-                    )
-                  }}
+                  onClick={() => { void handleSetNotificationFilterMode(option.value as SessionFilterMode) }}
                 >
                   {option.label}
                   {notificationFilterMode === option.value && <Check size={14} />}
@@ -1392,11 +1811,33 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 : '点击左侧会话添加到黑名单，点击右侧会话从黑名单移除'}
             </span>
 
+            <div className="push-filter-type-tabs">
+              {sessionFilterTypeOptions.map(option => (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`push-filter-type-tab ${notificationTypeFilter === option.value ? 'active' : ''}`}
+                  onClick={() => setNotificationTypeFilter(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
             <div className="notification-filter-container">
               {/* 可选会话列表 */}
               <div className="filter-panel">
                 <div className="filter-panel-header">
                   <span>可选会话</span>
+                  {notificationAvailableSessions.length > 0 && (
+                    <button
+                      type="button"
+                      className="filter-panel-action"
+                      onClick={() => { void handleAddAllNotificationFilterSessions() }}
+                    >
+                      全选当前
+                    </button>
+                  )}
                   <div className="filter-search-box">
                     <Search size={14} />
                     <input
@@ -1408,8 +1849,8 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                   </div>
                 </div>
                 <div className="filter-panel-list">
-                  {availableSessions.length > 0 ? (
-                    availableSessions.map(session => (
+                  {notificationAvailableSessions.length > 0 ? (
+                    notificationAvailableSessions.map(session => (
                       <div
                         key={session.username}
                         className="filter-panel-item"
@@ -1421,12 +1862,13 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                           size={28}
                         />
                         <span className="filter-item-name">{session.displayName || session.username}</span>
+                        <span className="filter-item-type">{getSessionFilterTypeLabel(session.type)}</span>
                         <span className="filter-item-action">+</span>
                       </div>
                     ))
                   ) : (
                     <div className="filter-panel-empty">
-                      {filterSearchKeyword ? '没有匹配的会话' : '暂无可添加的会话'}
+                      {filterSearchKeyword || notificationTypeFilter !== 'all' ? '没有匹配的会话' : '暂无可添加的会话'}
                     </div>
                   )}
                 </div>
@@ -1439,11 +1881,20 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                   {notificationFilterList.length > 0 && (
                     <span className="filter-panel-count">{notificationFilterList.length}</span>
                   )}
+                  {notificationFilterList.length > 0 && (
+                    <button
+                      type="button"
+                      className="filter-panel-action"
+                      onClick={() => { void handleRemoveAllNotificationFilterSessions() }}
+                    >
+                      全不选
+                    </button>
+                  )}
                 </div>
                 <div className="filter-panel-list">
                   {notificationFilterList.length > 0 ? (
                     notificationFilterList.map(username => {
-                      const info = getSessionInfo(username)
+                      const info = getSessionFilterOptionInfo(username)
                       return (
                         <div
                           key={username}
@@ -1456,6 +1907,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                             size={28}
                           />
                           <span className="filter-item-name">{info.displayName}</span>
+                          <span className="filter-item-type">{getSessionFilterTypeLabel(info.type)}</span>
                           <span className="filter-item-action">×</span>
                         </div>
                       )
@@ -1472,8 +1924,211 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     )
   }
 
+  const renderAntiRevokeTab = () => {
+    const sortedSessions = [...chatSessions].sort((a, b) => (b.sortTimestamp || 0) - (a.sortTimestamp || 0))
+    const keyword = antiRevokeSearchKeyword.trim().toLowerCase()
+    const filteredSessions = sortedSessions.filter((session) => {
+      if (!keyword) return true
+      const displayName = String(session.displayName || '').toLowerCase()
+      const username = String(session.username || '').toLowerCase()
+      return displayName.includes(keyword) || username.includes(keyword)
+    })
+    const filteredSessionIds = filteredSessions.map((session) => session.username)
+    const selectedCount = antiRevokeSelectedIds.size
+    const selectedInFilteredCount = filteredSessionIds.filter((sessionId) => antiRevokeSelectedIds.has(sessionId)).length
+    const allFilteredSelected = filteredSessionIds.length > 0 && selectedInFilteredCount === filteredSessionIds.length
+    const busy = isAntiRevokeRefreshing || isAntiRevokeInstalling || isAntiRevokeUninstalling
+    const statusStats = filteredSessions.reduce(
+      (acc, session) => {
+        const rowState = antiRevokeStatusMap[session.username]
+        if (rowState?.error) acc.failed += 1
+        else if (rowState?.installed === true) acc.installed += 1
+        else if (rowState?.installed === false) acc.notInstalled += 1
+        return acc
+      },
+      { installed: 0, notInstalled: 0, failed: 0 }
+    )
+
+    const toggleSelected = (sessionId: string) => {
+      setAntiRevokeSelectedIds((prev) => {
+        const next = new Set(prev)
+        if (next.has(sessionId)) next.delete(sessionId)
+        else next.add(sessionId)
+        return next
+      })
+    }
+
+    const selectAllFiltered = () => {
+      if (filteredSessionIds.length === 0) return
+      setAntiRevokeSelectedIds((prev) => {
+        const next = new Set(prev)
+        for (const sessionId of filteredSessionIds) {
+          next.add(sessionId)
+        }
+        return next
+      })
+    }
+
+    const clearSelection = () => {
+      setAntiRevokeSelectedIds(new Set())
+    }
+
+    return (
+      <div className="tab-content anti-revoke-tab">
+        <div className="anti-revoke-hero">
+          <div className="anti-revoke-hero-main">
+            <h3>防撤回</h3>
+            <p>你可以根据会话进行防撤回部署，安装后无需保持 WeFlow 运行即可实现防撤回</p>
+          </div>
+          <div className="anti-revoke-metrics">
+            <div className="anti-revoke-metric is-total">
+              <span className="label">筛选会话</span>
+              <span className="value">{filteredSessionIds.length}</span>
+            </div>
+            <div className="anti-revoke-metric is-installed">
+              <span className="label">已安装</span>
+              <span className="value">{statusStats.installed}</span>
+            </div>
+            <div className="anti-revoke-metric is-pending">
+              <span className="label">未安装</span>
+              <span className="value">{statusStats.notInstalled}</span>
+            </div>
+            <div className="anti-revoke-metric is-error">
+              <span className="label">异常</span>
+              <span className="value">{statusStats.failed}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="anti-revoke-control-card">
+          <div className="anti-revoke-toolbar">
+            <div className="filter-search-box anti-revoke-search">
+              <Search size={14} />
+              <input
+                type="text"
+                placeholder="搜索会话..."
+                value={antiRevokeSearchKeyword}
+                onChange={(e) => setAntiRevokeSearchKeyword(e.target.value)}
+              />
+            </div>
+            <div className="anti-revoke-toolbar-actions">
+              <div className="anti-revoke-btn-group">
+                <button className="btn btn-secondary btn-sm" onClick={() => void handleRefreshAntiRevokeStatus()} disabled={busy}>
+                  <RefreshCw size={14} /> {isAntiRevokeRefreshing ? '刷新中...' : '刷新状态'}
+                </button>
+              </div>
+              <div className="anti-revoke-btn-group">
+                <button className="btn btn-secondary btn-sm" onClick={selectAllFiltered} disabled={busy || filteredSessionIds.length === 0 || allFilteredSelected}>
+                  全选
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={clearSelection} disabled={busy || selectedCount === 0}>
+                  清空选择
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="anti-revoke-batch-actions">
+            <div className="anti-revoke-btn-group anti-revoke-batch-btns">
+              <button className="btn btn-primary btn-sm" onClick={() => void handleInstallAntiRevokeTriggers()} disabled={busy || selectedCount === 0}>
+                {isAntiRevokeInstalling ? '安装中...' : '批量安装'}
+              </button>
+              <button className="btn btn-secondary btn-sm" onClick={() => void handleUninstallAntiRevokeTriggers()} disabled={busy || selectedCount === 0}>
+                {isAntiRevokeUninstalling ? '卸载中...' : '批量卸载'}
+              </button>
+            </div>
+            <div className="anti-revoke-selected-count">
+              <span>已选 <strong>{selectedCount}</strong> 个会话</span>
+              <span>筛选命中 <strong>{selectedInFilteredCount}</strong> / {filteredSessionIds.length}</span>
+            </div>
+          </div>
+        </div>
+
+        {antiRevokeSummary && (
+          <div className={`anti-revoke-summary ${antiRevokeSummary.failed > 0 ? 'error' : 'success'}`}>
+            {antiRevokeSummary.action === 'refresh' ? '刷新' : antiRevokeSummary.action === 'install' ? '安装' : '卸载'}
+            完成：成功 {antiRevokeSummary.success}，失败 {antiRevokeSummary.failed}
+          </div>
+        )}
+
+        <div className="anti-revoke-list">
+          {filteredSessions.length === 0 ? (
+            <div className="anti-revoke-empty">{antiRevokeSearchKeyword ? '没有匹配的会话' : '暂无会话可配置'}</div>
+          ) : (
+            <>
+              <div className="anti-revoke-list-header">
+                <span>会话（{filteredSessions.length}）</span>
+                <span>状态</span>
+              </div>
+              {filteredSessions.map((session) => {
+                const rowState = antiRevokeStatusMap[session.username]
+                let statusClass = 'unknown'
+                let statusLabel = '未检查'
+                if (rowState?.loading) {
+                  statusClass = 'checking'
+                  statusLabel = '检查中'
+                } else if (rowState?.error) {
+                  statusClass = 'error'
+                  statusLabel = '失败'
+                } else if (rowState?.installed === true) {
+                  statusClass = 'installed'
+                  statusLabel = '已安装'
+                } else if (rowState?.installed === false) {
+                  statusClass = 'not-installed'
+                  statusLabel = '未安装'
+                }
+                return (
+                  <div key={session.username} className={`anti-revoke-row ${antiRevokeSelectedIds.has(session.username) ? 'selected' : ''}`}>
+                    <label className="anti-revoke-row-main">
+                      <span className="anti-revoke-check">
+                        <input
+                          type="checkbox"
+                          checked={antiRevokeSelectedIds.has(session.username)}
+                          onChange={() => toggleSelected(session.username)}
+                          disabled={busy}
+                        />
+                        <span className="check-indicator" aria-hidden="true">
+                          <Check size={12} />
+                        </span>
+                      </span>
+                      <Avatar
+                        src={session.avatarUrl}
+                        name={session.displayName || session.username}
+                        size={30}
+                      />
+                      <div className="anti-revoke-row-text">
+                        <span className="name">{session.displayName || session.username}</span>
+                      </div>
+                    </label>
+                    <div className="anti-revoke-row-status">
+                      <span className={`status-badge ${statusClass}`}>
+                        <i className="status-dot" aria-hidden="true" />
+                        {statusLabel}
+                      </span>
+                      {rowState?.error && <span className="status-error">{rowState.error}</span>}
+                    </div>
+                  </div>
+                )
+              })}
+            </>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   const renderDatabaseTab = () => (
     <div className="tab-content">
+      <div className="form-group">
+        <label>连接测试</label>
+        <span className="form-hint">检测当前数据库配置是否可用</span>
+        <button className="btn btn-secondary" onClick={handleTestConnection} disabled={isLoading || isTesting}>
+          <Plug size={16} /> {isTesting ? '测试中...' : '测试连接'}
+        </button>
+      </div>
+
+      <div className="divider" />
+
       <div className="form-group">
         <label>解密密钥</label>
         <span className="form-hint">64位十六进制密钥</span>
@@ -1497,9 +2152,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         </div>
         {isManualStartPrompt ? (
           <div className="manual-prompt">
-            <p className="prompt-text">未能自动启动微信，请手动启动并登录后点击下方确认</p>
+            <p className="prompt-text">未能自动启动微信，请手动启动微信，看到登录窗口后点击下方确认</p>
             <button className="btn btn-primary btn-sm" onClick={handleManualConfirm}>
-              我已启动微信，继续检测
+              我已看到登录窗口，继续检测
             </button>
           </div>
         ) : (
@@ -1906,6 +2561,856 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     showMessage(enabled ? '已开启主动推送' : '已关闭主动推送', true)
   }
 
+  const getSessionFilterType = (session: { username: string; type?: ContactInfo['type'] | number }): SessionFilterType => {
+    const username = String(session.username || '').trim()
+    if (username.endsWith('@chatroom')) return 'group'
+    if (username.startsWith('gh_') || session.type === 'official') return 'official'
+    if (username.toLowerCase().includes('placeholder_foldgroup')) return 'other'
+    if (session.type === 'former_friend' || session.type === 'other') return 'other'
+    return 'private'
+  }
+
+  const getSessionFilterTypeLabel = (type: SessionFilterType) => {
+    switch (type) {
+      case 'private': return '私聊'
+      case 'group': return '群聊'
+      case 'official': return '订阅号/服务号'
+      default: return '其他/非好友'
+    }
+  }
+
+  const handleSetMessagePushFilterMode = async (mode: configService.MessagePushFilterMode) => {
+    setMessagePushFilterMode(mode)
+    setMessagePushFilterDropdownOpen(false)
+    await configService.setMessagePushFilterMode(mode)
+    showMessage(
+      mode === 'all' ? '主动推送已设为接收所有会话' :
+        mode === 'whitelist' ? '主动推送已设为仅推送白名单' : '主动推送已设为屏蔽黑名单',
+      true
+    )
+  }
+
+  const handleAddMessagePushFilterSession = async (username: string) => {
+    if (messagePushFilterList.includes(username)) return
+    const next = [...messagePushFilterList, username]
+    setMessagePushFilterList(next)
+    await configService.setMessagePushFilterList(next)
+    showMessage('已添加到主动推送过滤列表', true)
+  }
+
+  const handleRemoveMessagePushFilterSession = async (username: string) => {
+    const next = messagePushFilterList.filter(item => item !== username)
+    setMessagePushFilterList(next)
+    await configService.setMessagePushFilterList(next)
+    showMessage('已从主动推送过滤列表移除', true)
+  }
+
+  const handleAddAllMessagePushFilterSessions = async () => {
+    const usernames = messagePushAvailableSessions.map(session => session.username)
+    if (usernames.length === 0) return
+    const next = Array.from(new Set([...messagePushFilterList, ...usernames]))
+    setMessagePushFilterList(next)
+    await configService.setMessagePushFilterList(next)
+    showMessage(`已添加 ${usernames.length} 个会话`, true)
+  }
+
+  const handleRemoveAllMessagePushFilterSessions = async () => {
+    if (messagePushFilterList.length === 0) return
+    setMessagePushFilterList([])
+    await configService.setMessagePushFilterList([])
+    showMessage('已清空主动推送过滤列表', true)
+  }
+
+  const sessionFilterOptionMap = new Map<string, SessionFilterOption>()
+
+  for (const session of chatSessions) {
+    if (session.username.toLowerCase().includes('placeholder_foldgroup')) continue
+    sessionFilterOptionMap.set(session.username, {
+      username: session.username,
+      displayName: session.displayName || session.username,
+      avatarUrl: session.avatarUrl,
+      type: getSessionFilterType(session)
+    })
+  }
+
+  for (const contact of messagePushContactOptions) {
+    if (!contact.username) continue
+    if (contact.type !== 'friend' && contact.type !== 'group' && contact.type !== 'official' && contact.type !== 'former_friend') continue
+    const existing = sessionFilterOptionMap.get(contact.username)
+    sessionFilterOptionMap.set(contact.username, {
+      username: contact.username,
+      displayName: existing?.displayName || contact.displayName || contact.remark || contact.nickname || contact.username,
+      avatarUrl: existing?.avatarUrl || contact.avatarUrl,
+      type: getSessionFilterType(contact)
+    })
+  }
+
+  const sessionFilterOptions = Array.from(sessionFilterOptionMap.values())
+    .sort((a, b) => {
+      const aSession = chatSessions.find(session => session.username === a.username)
+      const bSession = chatSessions.find(session => session.username === b.username)
+      return Number(bSession?.sortTimestamp || bSession?.lastTimestamp || 0) -
+        Number(aSession?.sortTimestamp || aSession?.lastTimestamp || 0)
+    })
+
+  const getSessionFilterOptionInfo = (username: string) => {
+    return sessionFilterOptionMap.get(username) || {
+      username,
+      displayName: username,
+      avatarUrl: undefined,
+      type: 'other' as SessionFilterType
+    }
+  }
+
+  const getAvailableSessionFilterOptions = (
+    selectedList: string[],
+    typeFilter: SessionFilterTypeValue,
+    searchKeyword: string
+  ) => {
+    const keyword = searchKeyword.trim().toLowerCase()
+    return sessionFilterOptions.filter(session => {
+      if (selectedList.includes(session.username)) return false
+      if (typeFilter !== 'all' && session.type !== typeFilter) return false
+      if (keyword) {
+        return String(session.displayName || '').toLowerCase().includes(keyword) ||
+          session.username.toLowerCase().includes(keyword)
+      }
+      return true
+    })
+  }
+
+  const notificationAvailableSessions = getAvailableSessionFilterOptions(
+    notificationFilterList,
+    notificationTypeFilter,
+    filterSearchKeyword
+  )
+
+  const messagePushAvailableSessions = getAvailableSessionFilterOptions(
+    messagePushFilterList,
+    messagePushTypeFilter,
+    messagePushFilterSearchKeyword
+  )
+
+  const handleAddAllNotificationFilterSessions = async () => {
+    const usernames = notificationAvailableSessions.map(session => session.username)
+    if (usernames.length === 0) return
+    const next = Array.from(new Set([...notificationFilterList, ...usernames]))
+    setNotificationFilterList(next)
+    await configService.setNotificationFilterList(next)
+    showMessage(`已添加 ${usernames.length} 个会话`, true)
+  }
+
+  const handleRemoveAllNotificationFilterSessions = async () => {
+    if (notificationFilterList.length === 0) return
+    setNotificationFilterList([])
+    await configService.setNotificationFilterList([])
+    showMessage('已清空通知过滤列表', true)
+  }
+
+  const handleSetNotificationFilterMode = async (mode: SessionFilterMode) => {
+    setNotificationFilterMode(mode)
+    setFilterModeDropdownOpen(false)
+    await configService.setNotificationFilterMode(mode)
+    showMessage(
+      mode === 'all' ? '已设为接收所有通知' :
+        mode === 'whitelist' ? '已设为仅接收白名单通知' : '已设为屏蔽黑名单通知',
+      true
+    )
+  }
+
+  const handleTestInsightConnection = async () => {
+    setIsTestingInsight(true)
+    setInsightTestResult(null)
+    try {
+      const result = await (window.electronAPI as any).insight.testConnection()
+      setInsightTestResult(result)
+    } catch (e: any) {
+      setInsightTestResult({ success: false, message: `调用失败：${e?.message || String(e)}` })
+    } finally {
+      setIsTestingInsight(false)
+    }
+  }
+
+  const renderAiCommonTab = () => (
+    <div className="tab-content">
+      <div className="form-group">
+        <label>通用 API 地址</label>
+        <span className="form-hint">
+          这是「AI 见解」与「AI 足迹总结」共享的模型接入配置。填写 OpenAI 兼容接口的 <strong>Base URL</strong>，末尾<strong>不要加斜杠</strong>。
+          程序会自动拼接 <code>/chat/completions</code>。
+          <br />
+          示例：<code>https://api.ohmygpt.com/v1</code> 或 <code>https://api.openai.com/v1</code>
+        </span>
+        <input
+          type="text"
+          className="field-input"
+          value={aiModelApiBaseUrl}
+          placeholder="https://api.ohmygpt.com/v1"
+          onChange={(e) => {
+            const val = e.target.value
+            setAiModelApiBaseUrl(val)
+            scheduleConfigSave('aiModelApiBaseUrl', () => configService.setAiModelApiBaseUrl(val))
+          }}
+        />
+      </div>
+
+      <div className="form-group">
+        <label>通用 API Key</label>
+        <span className="form-hint">
+          你的 API Key，保存后经过系统加密存储，不会明文写入磁盘。
+        </span>
+        <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+          <input
+            type={showInsightApiKey ? 'text' : 'password'}
+            className="field-input"
+            value={aiModelApiKey}
+            placeholder="sk-..."
+            onChange={(e) => {
+              const val = e.target.value
+              setAiModelApiKey(val)
+              scheduleConfigSave('aiModelApiKey', () => configService.setAiModelApiKey(val))
+            }}
+            style={{ flex: 1 }}
+          />
+          <button
+            className="btn btn-secondary"
+            onClick={() => setShowInsightApiKey(!showInsightApiKey)}
+            title={showInsightApiKey ? '隐藏' : '显示'}
+          >
+            {showInsightApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+          {aiModelApiKey && (
+            <button
+              className="btn btn-danger"
+              onClick={async () => {
+                setAiModelApiKey('')
+                await configService.setAiModelApiKey('')
+              }}
+              title="清除 Key"
+            >
+              <Trash2 size={14} />
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="form-group">
+        <label>通用模型名称</label>
+        <span className="form-hint">
+          填写你的 API 提供商支持的模型名，将同时用于见解和足迹模块。
+          <br />
+          常用示例：<code>gpt-4o-mini</code>、<code>gpt-4o</code>、<code>deepseek-chat</code>、<code>claude-3-5-haiku-20241022</code>
+        </span>
+        <input
+          type="text"
+          className="field-input"
+          value={aiModelApiModel}
+          placeholder="gpt-4o-mini"
+          onChange={(e) => {
+            const val = e.target.value.trim() || 'gpt-4o-mini'
+            setAiModelApiModel(val)
+            scheduleConfigSave('aiModelApiModel', () => configService.setAiModelApiModel(val))
+          }}
+          style={{ width: 260 }}
+        />
+      </div>
+
+      <div className="form-group">
+        <label>连接测试</label>
+        <span className="form-hint">
+          测试通用模型连接，见解与足迹都会使用这套配置。
+        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap', marginTop: '10px' }}>
+          <button
+            className="btn btn-secondary"
+            onClick={handleTestInsightConnection}
+            disabled={isTestingInsight || !aiModelApiBaseUrl || !aiModelApiKey}
+          >
+            {isTestingInsight ? (
+              <><Loader2 size={14} style={{ marginRight: 4, animation: 'spin 1s linear infinite' }} />测试中...</>
+            ) : (
+              <>测试 API 连接</>
+            )}
+          </button>
+          {insightTestResult && (
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: insightTestResult.success ? 'var(--color-success, #22c55e)' : 'var(--color-danger, #ef4444)' }}>
+              {insightTestResult.success ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+              {insightTestResult.message}
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+
+  const renderInsightTab = () => (
+    <div className="tab-content">
+      {/* 总开关 */}
+      <div className="form-group">
+        <label>AI 见解</label>
+        <span className="form-hint">
+          开启后，AI 会在后台默默分析聊天数据，在合适的时机通过右下角弹窗送出一针见血的见解——例如提醒你久未联系的朋友，或对你刚刚的对话提出回复建议。默认关闭，所有分析均在本地发起请求，不经过任何第三方中间服务。
+        </span>
+        <div className="log-toggle-line">
+          <span className="log-status">{aiInsightEnabled ? '已开启' : '已关闭'}</span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={aiInsightEnabled}
+              onChange={async (e) => {
+                const val = e.target.checked
+                setAiInsightEnabled(val)
+                await configService.setAiInsightEnabled(val)
+                showMessage(val ? 'AI 见解已开启' : 'AI 见解已关闭', true)
+              }}
+            />
+            <span className="switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      <div className="divider" />
+
+      <div className="form-group">
+        <label>调试工具</label>
+        <span className="form-hint">
+          该功能依赖「AI 通用」里的模型配置。用于验证完整链路（数据库→API→弹窗）。
+        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap', marginTop: '10px' }}>
+          <button
+            className="btn btn-secondary"
+            onClick={async () => {
+              setIsTriggeringInsightTest(true)
+              setInsightTriggerResult(null)
+              try {
+                const result = await (window.electronAPI as any).insight.triggerTest()
+                setInsightTriggerResult(result)
+              } catch (e: any) {
+                setInsightTriggerResult({ success: false, message: `调用失败：${e?.message || String(e)}` })
+              } finally {
+                setIsTriggeringInsightTest(false)
+              }
+            }}
+            disabled={isTriggeringInsightTest || !aiInsightEnabled || !aiModelApiBaseUrl || !aiModelApiKey}
+            title={!aiInsightEnabled ? '请先开启 AI 见解总开关' : ''}
+          >
+            {isTriggeringInsightTest ? (
+              <><Loader2 size={14} style={{ marginRight: 4, animation: 'spin 1s linear infinite' }} />触发中...</>
+            ) : (
+              <>立即触发测试见解</>
+            )}
+          </button>
+          {insightTriggerResult && (
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: insightTriggerResult.success ? 'var(--color-success, #22c55e)' : 'var(--color-danger, #ef4444)' }}>
+              {insightTriggerResult.success ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+              {insightTriggerResult.message}
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="divider" />
+
+      {/* 行为配置 */}
+      <div className="form-group">
+        <label>活跃触发冷却期（分钟）</label>
+        <span className="form-hint">
+          有新消息时触发活跃分析的冷却时间。设为 <strong>0</strong> 表示无冷却，每条新消息都可能触发见解（AI 言论自由模式）。建议按需调整，费用自理。
+        </span>
+        <input
+          type="number"
+          className="field-input"
+          value={aiInsightCooldownMinutes}
+          min={0}
+          max={10080}
+          onChange={(e) => {
+            const val = Math.max(0, parseInt(e.target.value, 10) || 0)
+            setAiInsightCooldownMinutes(val)
+            scheduleConfigSave('aiInsightCooldownMinutes', () => configService.setAiInsightCooldownMinutes(val))
+          }}
+          style={{ width: 120 }}
+        />
+        {aiInsightCooldownMinutes === 0 && (
+          <span style={{ marginLeft: 10, fontSize: 12, color: 'var(--color-warning, #f59e0b)' }}>
+            无冷却 — 每次 DB 变更均可触发
+          </span>
+        )}
+      </div>
+
+      <div className="form-group">
+        <label>沉默联系人扫描间隔（小时）</label>
+        <span className="form-hint">
+          多久扫描一次沉默联系人。重启生效。最小 0.1 小时（6 分钟）。
+        </span>
+        <input
+          type="number"
+          className="field-input"
+          value={aiInsightScanIntervalHours}
+          min={0.1}
+          max={168}
+          step={0.5}
+          onChange={(e) => {
+            const val = Math.max(0.1, parseFloat(e.target.value) || 4)
+            setAiInsightScanIntervalHours(val)
+            scheduleConfigSave('aiInsightScanIntervalHours', () => configService.setAiInsightScanIntervalHours(val))
+          }}
+          style={{ width: 120 }}
+        />
+      </div>
+
+      <div className="form-group">
+        <label>沉默联系人阈值（天）</label>
+        <span className="form-hint">
+          与某私聊联系人超过此天数没有消息往来时，触发沉默类见解。
+        </span>
+        <input
+          type="number"
+          className="field-input"
+          value={aiInsightSilenceDays}
+          min={1}
+          max={365}
+          onChange={(e) => {
+            const val = Math.max(1, parseInt(e.target.value, 10) || 3)
+            setAiInsightSilenceDays(val)
+            scheduleConfigSave('aiInsightSilenceDays', () => configService.setAiInsightSilenceDays(val))
+          }}
+          style={{ width: 100 }}
+        />
+      </div>
+
+      <div className="form-group">
+        <label>允许发送近期对话内容用于分析</label>
+        <span className="form-hint">
+          开启后，触发见解时会将该联系人最近 N 条聊天记录发送给 AI，分析质量显著提升。
+          <br />
+          <strong>关闭时</strong>：AI 仅知道统计摘要（沉默天数等），输出质量较低。
+          <br />
+          <strong>开启时</strong>：聊天文本内容（不含图片、语音）会通过你配置的 API 发送给模型提供商。请确认你信任该服务商。
+        </span>
+        <div className="log-toggle-line">
+          <span className="log-status">{aiInsightAllowContext ? '已授权' : '未授权'}</span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={aiInsightAllowContext}
+              onChange={async (e) => {
+                const val = e.target.checked
+                setAiInsightAllowContext(val)
+                await configService.setAiInsightAllowContext(val)
+              }}
+            />
+            <span className="switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      {aiInsightAllowContext && (
+        <div className="form-group">
+          <label>发送近期对话条数</label>
+          <span className="form-hint">
+            发送给 AI 的聊天记录最大条数。条数越多分析越准确，token 消耗也越多。
+          </span>
+          <input
+            type="number"
+            className="field-input"
+            value={aiInsightContextCount}
+            min={1}
+            max={200}
+            onChange={(e) => {
+              const val = Math.max(1, Math.min(200, parseInt(e.target.value, 10) || 40))
+              setAiInsightContextCount(val)
+              scheduleConfigSave('aiInsightContextCount', () => configService.setAiInsightContextCount(val))
+            }}
+            style={{ width: 100 }}
+          />
+        </div>
+      )}
+
+      <div className="divider" />
+
+      {/* 自定义 System Prompt */}
+      {(() => {
+        const DEFAULT_SYSTEM_PROMPT = `你是用户的私人关系观察助手，名叫"见解"。你的任务是主动提供有价值的观察和建议。
+
+要求：
+1. 必须给出见解。基于聊天记录分析对方情绪、话题趋势、关系动态，或给出回复建议、聊天话题推荐。
+2. 控制在 80 字以内，直接、具体、一针见血。不要废话。
+3. 输出纯文本，不使用 Markdown。
+4. 只有在完全没有任何可说的内容时（比如对话只有一条"嗯"），才回复"SKIP"。绝大多数情况下你应该输出见解。`
+
+        // 展示值：有自定义内容时显示自定义内容，否则显示默认值（可直接编辑）
+        const displayValue = aiInsightSystemPrompt || DEFAULT_SYSTEM_PROMPT
+
+        return (
+          <div className="form-group">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <label style={{ marginBottom: 0 }}>自定义 AI 见解提示词</label>
+              <button
+                className="button-secondary"
+                style={{ fontSize: 12, padding: '3px 10px' }}
+                onClick={async () => {
+                  // 恢复默认：清空自定义值，UI 回到显示默认内容的状态
+                  setAiInsightSystemPrompt('')
+                  await configService.setAiInsightSystemPrompt('')
+                }}
+              >
+                恢复默认
+              </button>
+            </div>
+            <span className="form-hint">
+              当前显示内置默认提示词，可直接编辑修改。修改后立即生效，无需重启。可变的统计信息（触发次数、对话内容）会自动附加在用户消息里，无需在此填写。
+            </span>
+            <textarea
+              className="field-input ai-prompt-textarea"
+              rows={8}
+              style={{ width: '100%', resize: 'vertical' }}
+              value={displayValue}
+              onChange={(e) => {
+                const val = e.target.value
+                // 如果用户把内容改得和默认值一样，仍存自定义值（不影响功能）
+                setAiInsightSystemPrompt(val)
+                scheduleConfigSave('aiInsightSystemPrompt', () => configService.setAiInsightSystemPrompt(val))
+              }}
+            />
+          </div>
+        )
+      })()}
+
+      <div className="divider" />
+
+      {/* Telegram 推送 */}
+      <div className="form-group">
+        <label>Telegram Bot 推送</label>
+        <span className="form-hint">
+          开启后，见解同时推送到指定 Telegram 用户/群组，方便手机即时收到通知。需要先创建 Bot 并获取 Token（通过 @BotFather），Chat ID 可通过 @userinfobot 获取，多个 ID 用英文逗号分隔。
+        </span>
+        <div className="log-toggle-line">
+          <span className="log-status">{aiInsightTelegramEnabled ? '已启用' : '未启用'}</span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={aiInsightTelegramEnabled}
+              onChange={async (e) => {
+                const val = e.target.checked
+                setAiInsightTelegramEnabled(val)
+                await configService.setAiInsightTelegramEnabled(val)
+              }}
+            />
+            <span className="switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      {aiInsightTelegramEnabled && (
+        <>
+          <div className="form-group">
+            <label>Bot Token</label>
+            <input
+              type="password"
+              className="field-input"
+              style={{ width: '100%' }}
+              placeholder="在此处填入你的 Telegram Bot Token"
+              value={aiInsightTelegramToken}
+              onChange={(e) => {
+                const val = e.target.value
+                setAiInsightTelegramToken(val)
+                scheduleConfigSave('aiInsightTelegramToken', () => configService.setAiInsightTelegramToken(val))
+              }}
+            />
+          </div>
+          <div className="form-group">
+            <label>Chat ID（支持英文逗号分隔多个）</label>
+            <input
+              type="text"
+              className="field-input"
+              style={{ width: '100%' }}
+              placeholder="123456789, -987654321"
+              value={aiInsightTelegramChatIds}
+              onChange={(e) => {
+                const val = e.target.value
+                setAiInsightTelegramChatIds(val)
+                scheduleConfigSave('aiInsightTelegramChatIds', () => configService.setAiInsightTelegramChatIds(val))
+              }}
+            />
+          </div>
+        </>
+      )}
+
+      <div className="divider" />
+
+      {/* 对话白名单 */}
+      {(() => {
+        const sortedSessions = [...chatSessions].sort((a, b) => (b.sortTimestamp || 0) - (a.sortTimestamp || 0))
+        const keyword = insightWhitelistSearch.trim().toLowerCase()
+        const filteredSessions = sortedSessions.filter((s) => {
+          const id = s.username?.trim() || ''
+          if (!id || id.endsWith('@chatroom') || id.toLowerCase().includes('placeholder')) return false
+          if (!keyword) return true
+          return (
+            String(s.displayName || '').toLowerCase().includes(keyword) ||
+            id.toLowerCase().includes(keyword)
+          )
+        })
+        const filteredIds = filteredSessions.map((s) => s.username)
+        const selectedCount = aiInsightWhitelist.size
+        const selectedInFilteredCount = filteredIds.filter((id) => aiInsightWhitelist.has(id)).length
+        const allFilteredSelected = filteredIds.length > 0 && selectedInFilteredCount === filteredIds.length
+
+        const toggleSession = (id: string) => {
+          setAiInsightWhitelist((prev) => {
+            const next = new Set(prev)
+            if (next.has(id)) next.delete(id)
+            else next.add(id)
+            return next
+          })
+        }
+
+        const saveWhitelist = async (next: Set<string>) => {
+          await configService.setAiInsightWhitelist(Array.from(next))
+        }
+
+        const selectAllFiltered = () => {
+          setAiInsightWhitelist((prev) => {
+            const next = new Set(prev)
+            for (const id of filteredIds) next.add(id)
+            void saveWhitelist(next)
+            return next
+          })
+        }
+
+        const clearSelection = () => {
+          const next = new Set<string>()
+          setAiInsightWhitelist(next)
+          void saveWhitelist(next)
+        }
+
+        return (
+          <div className="anti-revoke-tab">
+            <div className="anti-revoke-hero">
+              <div className="anti-revoke-hero-main">
+                <h3>对话白名单</h3>
+                <p>
+                  开启后，AI 见解仅对勾选的私聊对话生效，未勾选的对话将被完全忽略。关闭时对所有私聊均生效。
+                </p>
+              </div>
+              <div className="anti-revoke-metrics">
+                <div className="anti-revoke-metric is-total">
+                  <span className="label">私聊总数</span>
+                  <span className="value">{filteredIds.length + (keyword ? 0 : 0)}</span>
+                </div>
+                <div className="anti-revoke-metric is-installed">
+                  <span className="label">已选中</span>
+                  <span className="value">{selectedCount}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="log-toggle-line" style={{ marginBottom: 12 }}>
+              <span className="log-status" style={{ fontWeight: 600 }}>
+                {aiInsightWhitelistEnabled ? '白名单已启用（仅对勾选对话生效）' : '白名单未启用（对所有私聊生效）'}
+              </span>
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  checked={aiInsightWhitelistEnabled}
+                  onChange={async (e) => {
+                    const val = e.target.checked
+                    setAiInsightWhitelistEnabled(val)
+                    await configService.setAiInsightWhitelistEnabled(val)
+                  }}
+                />
+                <span className="switch-slider" />
+              </label>
+            </div>
+
+            <div className="anti-revoke-control-card">
+              <div className="anti-revoke-toolbar">
+                <div className="filter-search-box anti-revoke-search">
+                  <Search size={14} />
+                  <input
+                    type="text"
+                    placeholder="搜索私聊对话..."
+                    value={insightWhitelistSearch}
+                    onChange={(e) => setInsightWhitelistSearch(e.target.value)}
+                  />
+                </div>
+                <div className="anti-revoke-toolbar-actions">
+                  <div className="anti-revoke-btn-group">
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={selectAllFiltered}
+                      disabled={filteredIds.length === 0 || allFilteredSelected}
+                    >
+                      全选
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={clearSelection}
+                      disabled={selectedCount === 0}
+                    >
+                      清空选择
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="anti-revoke-batch-actions">
+                <div className="anti-revoke-selected-count">
+                  <span>已选 <strong>{selectedCount}</strong> 个对话</span>
+                  <span>筛选命中 <strong>{selectedInFilteredCount}</strong> / {filteredIds.length}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="anti-revoke-list">
+              {filteredSessions.length === 0 ? (
+                <div className="anti-revoke-empty">
+                  {insightWhitelistSearch ? '没有匹配的对话' : '暂无私聊对话'}
+                </div>
+              ) : (
+                <>
+                  <div className="anti-revoke-list-header">
+                    <span>对话（{filteredSessions.length}）</span>
+                    <span>状态</span>
+                  </div>
+                  {filteredSessions.map((session) => {
+                    const isSelected = aiInsightWhitelist.has(session.username)
+                    return (
+                      <div
+                        key={session.username}
+                        className={`anti-revoke-row ${isSelected ? 'selected' : ''}`}
+                      >
+                        <label className="anti-revoke-row-main">
+                          <span className="anti-revoke-check">
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={async () => {
+                                setAiInsightWhitelist((prev) => {
+                                  const next = new Set(prev)
+                                  if (next.has(session.username)) next.delete(session.username)
+                                  else next.add(session.username)
+                                  void configService.setAiInsightWhitelist(Array.from(next))
+                                  return next
+                                })
+                              }}
+                            />
+                            <span className="check-indicator" aria-hidden="true">
+                              <Check size={12} />
+                            </span>
+                          </span>
+                          <Avatar
+                            src={session.avatarUrl}
+                            name={session.displayName || session.username}
+                            size={30}
+                          />
+                          <div className="anti-revoke-row-text">
+                            <span className="name">{session.displayName || session.username}</span>
+                          </div>
+                        </label>
+                        <div className="anti-revoke-row-status">
+                          <span className={`status-badge ${isSelected ? 'installed' : 'not-installed'}`}>
+                            <i className="status-dot" aria-hidden="true" />
+                            {isSelected ? '已加入' : '未加入'}
+                          </span>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </>
+              )}
+            </div>
+          </div>
+        )
+      })()}
+
+      <div className="divider" />
+
+      {/* 工作原理说明 */}
+      <div className="form-group">
+        <label>工作原理</label>
+        <div className="api-docs">
+          <div className="api-item">
+            <p className="api-desc" style={{ lineHeight: 1.7 }}>
+              <strong>触发方式一：活跃会话分析</strong> — 每当微信数据库变化（即你收到新消息）时，经过 500ms 防抖后，对最近活跃的私聊会话进行分析。<br />
+              <strong>触发方式二：沉默扫描</strong> — 每 4 小时独立扫描一次，对超过阈值天数无消息的联系人发出提醒。<br />
+              <strong>时间观念</strong> — 每次调用时，AI 会收到今天已向该联系人和全局发出过多少次见解，由 AI 自行决定是否需要克制。<br />
+              <strong>隐私</strong> — 所有分析请求均直接从你的电脑发往你填写的 API 地址，不经过任何 WeFlow 服务器。
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+
+  const renderAiFootprintTab = () => (
+    <div className="tab-content">
+      {(() => {
+        const DEFAULT_FOOTPRINT_PROMPT = `你是用户的聊天足迹教练，负责基于统计数据给出一段简明复盘。
+要求：
+1. 输出 2-3 句，总长度不超过 180 字。
+2. 必须包含：总体观察 + 一个可执行建议。
+3. 语气务实，不夸张，不使用 Markdown。`
+        const displayValue = aiFootprintSystemPrompt || DEFAULT_FOOTPRINT_PROMPT
+        return (
+          <>
+            <div className="form-group">
+              <label>AI 足迹总结</label>
+              <span className="form-hint">
+                开启后，可在「我的微信足迹」页面一键生成当前范围的 AI 复盘总结。
+              </span>
+              <div className="log-toggle-line">
+                <span className="log-status">{aiFootprintEnabled ? '已开启' : '已关闭'}</span>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={aiFootprintEnabled}
+                    onChange={async (e) => {
+                      const val = e.target.checked
+                      setAiFootprintEnabled(val)
+                      await configService.setAiFootprintEnabled(val)
+                    }}
+                  />
+                  <span className="switch-slider" />
+                </label>
+              </div>
+            </div>
+
+            <div className="form-group">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <label style={{ marginBottom: 0 }}>足迹总结提示词</label>
+                <button
+                  className="button-secondary"
+                  style={{ fontSize: 12, padding: '3px 10px' }}
+                  onClick={async () => {
+                    setAiFootprintSystemPrompt('')
+                    await configService.setAiFootprintSystemPrompt('')
+                  }}
+                >
+                  恢复默认
+                </button>
+              </div>
+              <span className="form-hint">
+                足迹模块专用的小配置。留空时使用内置默认提示词。
+              </span>
+              <textarea
+                className="field-input ai-prompt-textarea"
+                rows={6}
+                style={{ width: '100%', resize: 'vertical' }}
+                value={displayValue}
+                onChange={(e) => {
+                  const val = e.target.value
+                  setAiFootprintSystemPrompt(val)
+                  scheduleConfigSave('aiFootprintSystemPrompt', () => configService.setAiFootprintSystemPrompt(val))
+                }}
+              />
+            </div>
+          </>
+        )
+      })()}
+    </div>
+  )
+
   const renderApiTab = () => (
     <div className="tab-content">
       <div className="form-group">
@@ -2047,6 +3552,154 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       </div>
 
       <div className="form-group">
+        <label>推送会话过滤</label>
+        <span className="form-hint">选择只推送特定会话，或屏蔽特定会话</span>
+        <div className="custom-select">
+          <div
+            className={`custom-select-trigger ${messagePushFilterDropdownOpen ? 'open' : ''}`}
+            onClick={() => setMessagePushFilterDropdownOpen(!messagePushFilterDropdownOpen)}
+          >
+            <span className="custom-select-value">
+              {messagePushFilterMode === 'all' ? '推送所有会话' :
+                messagePushFilterMode === 'whitelist' ? '仅推送白名单' : '屏蔽黑名单'}
+            </span>
+            <ChevronDown size={14} className={`custom-select-arrow ${messagePushFilterDropdownOpen ? 'rotate' : ''}`} />
+          </div>
+          <div className={`custom-select-dropdown ${messagePushFilterDropdownOpen ? 'open' : ''}`}>
+            {[
+              { value: 'all', label: '推送所有会话' },
+              { value: 'whitelist', label: '仅推送白名单' },
+              { value: 'blacklist', label: '屏蔽黑名单' }
+            ].map(option => (
+              <div
+                key={option.value}
+                className={`custom-select-option ${messagePushFilterMode === option.value ? 'selected' : ''}`}
+                onClick={() => { void handleSetMessagePushFilterMode(option.value as configService.MessagePushFilterMode) }}
+              >
+                {option.label}
+                {messagePushFilterMode === option.value && <Check size={14} />}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {messagePushFilterMode !== 'all' && (
+        <div className="form-group">
+          <label>{messagePushFilterMode === 'whitelist' ? '主动推送白名单' : '主动推送黑名单'}</label>
+          <span className="form-hint">
+            {messagePushFilterMode === 'whitelist'
+              ? '点击左侧会话添加到白名单，只有白名单会话会推送'
+              : '点击左侧会话添加到黑名单，黑名单会话不会推送'}
+          </span>
+          <div className="push-filter-type-tabs">
+            {sessionFilterTypeOptions.map(option => (
+              <button
+                key={option.value}
+                type="button"
+                className={`push-filter-type-tab ${messagePushTypeFilter === option.value ? 'active' : ''}`}
+                onClick={() => setMessagePushTypeFilter(option.value)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <div className="notification-filter-container">
+            <div className="filter-panel">
+              <div className="filter-panel-header">
+                <span>可选会话</span>
+                {messagePushAvailableSessions.length > 0 && (
+                  <button
+                    type="button"
+                    className="filter-panel-action"
+                    onClick={() => { void handleAddAllMessagePushFilterSessions() }}
+                  >
+                    全选当前
+                  </button>
+                )}
+                <div className="filter-search-box">
+                  <Search size={14} />
+                  <input
+                    type="text"
+                    placeholder="搜索会话..."
+                    value={messagePushFilterSearchKeyword}
+                    onChange={(e) => setMessagePushFilterSearchKeyword(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="filter-panel-list">
+                {messagePushAvailableSessions.length > 0 ? (
+                  messagePushAvailableSessions.map(session => (
+                    <div
+                      key={session.username}
+                      className="filter-panel-item"
+                      onClick={() => { void handleAddMessagePushFilterSession(session.username) }}
+                    >
+                      <Avatar
+                        src={session.avatarUrl}
+                        name={session.displayName || session.username}
+                        size={28}
+                      />
+                      <span className="filter-item-name">{session.displayName || session.username}</span>
+                      <span className="filter-item-type">{getSessionFilterTypeLabel(session.type)}</span>
+                      <span className="filter-item-action">+</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="filter-panel-empty">
+                    {messagePushFilterSearchKeyword || messagePushTypeFilter !== 'all' ? '没有匹配的会话' : '暂无可添加的会话'}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="filter-panel">
+              <div className="filter-panel-header">
+                <span>{messagePushFilterMode === 'whitelist' ? '白名单' : '黑名单'}</span>
+                {messagePushFilterList.length > 0 && (
+                  <span className="filter-panel-count">{messagePushFilterList.length}</span>
+                )}
+                {messagePushFilterList.length > 0 && (
+                  <button
+                    type="button"
+                    className="filter-panel-action"
+                    onClick={() => { void handleRemoveAllMessagePushFilterSessions() }}
+                  >
+                    全不选
+                  </button>
+                )}
+              </div>
+              <div className="filter-panel-list">
+                {messagePushFilterList.length > 0 ? (
+                  messagePushFilterList.map(username => {
+                    const session = getSessionFilterOptionInfo(username)
+                    return (
+                      <div
+                        key={username}
+                        className="filter-panel-item selected"
+                        onClick={() => { void handleRemoveMessagePushFilterSession(username) }}
+                      >
+                        <Avatar
+                          src={session.avatarUrl}
+                          name={session.displayName || username}
+                          size={28}
+                        />
+                        <span className="filter-item-name">{session.displayName || username}</span>
+                        <span className="filter-item-type">{getSessionFilterTypeLabel(session.type)}</span>
+                        <span className="filter-item-action">×</span>
+                      </div>
+                    )
+                  })
+                ) : (
+                  <div className="filter-panel-empty">尚未添加任何会话</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="form-group">
         <label>推送地址</label>
         <span className="form-hint">外部软件连接这个 SSE 地址即可接收新消息推送；需要先开启上方 `HTTP API 服务`</span>
         <div className="api-url-display">
@@ -2080,7 +3733,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
             </div>
             <p className="api-desc">通过 SSE 长连接接收消息事件，建议接收端按 `messageKey` 去重。</p>
             <div className="api-params">
-              {['event', 'sessionId', 'messageKey', 'avatarUrl', 'sourceName', 'groupName?', 'content'].map((param) => (
+              {['event', 'sessionId', 'sessionType', 'messageKey', 'avatarUrl', 'sourceName', 'groupName?', 'content'].map((param) => (
                 <span key={param} className="param">
                   <code>{param}</code>
                 </span>
@@ -2373,7 +4026,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 onClick={handleSetupHello}
                 disabled={!helloAvailable || isSettingHello || !authEnabled || !helloPassword}
               >
-                {isSettingHello ? '设置中...' : '开启与设置'}
+                {isSettingHello ? '配置中...' : '开启与设置'}
               </button>
             )}
           </div>
@@ -2400,47 +4053,21 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
           <img src="./logo.png" alt="WeFlow" />
         </div>
         <h2 className="about-name">WeFlow</h2>
-        <p className="about-slogan">WeFlow</p>
         <p className="about-version">v{appVersion || '...'}</p>
-
-        <div className="about-update">
-          {updateInfo?.hasUpdate ? (
-            <>
-              <p className="update-hint">新版 v{updateInfo.version} 可用</p>
-              {isDownloading ? (
-                <div className="update-progress">
-                  <div className="progress-bar">
-                    <div className="progress-inner" style={{ width: `${(downloadProgress?.percent || 0)}%` }} />
-                  </div>
-                  <span>{(downloadProgress?.percent || 0).toFixed(0)}%</span>
-                </div>
-              ) : (
-                <button className="btn btn-primary" onClick={() => setShowUpdateDialog(true)}>
-                  <Download size={16} /> 立即更新
-                </button>
-              )}
-            </>
-          ) : (
-            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-              <button className="btn btn-secondary" onClick={handleCheckUpdate} disabled={isCheckingUpdate}>
-                <RefreshCw size={16} className={isCheckingUpdate ? 'spin' : ''} />
-                {isCheckingUpdate ? '检查中...' : '检查更新'}
-              </button>
-            </div>
-          )}
-        </div>
       </div>
 
       <div className="about-footer">
         <p className="about-desc">微信聊天记录分析工具</p>
         <div className="about-links">
-          <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.shell.openExternal('https://github.com/hicccc77/WeFlow') }}>官网</a>
+          <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.shell.openExternal('https://weflow.top') }}>官网</a>
+          <span>·</span>
+          <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.shell.openExternal('https://github.com/hicccc77/WeFlow') }}>GitHub 仓库</a>
           <span>·</span>
           <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.shell.openExternal('https://chatlab.fun') }}>ChatLab</a>
           <span>·</span>
           <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.window.openAgreementWindow() }}>用户协议</a>
         </div>
-        <p className="copyright">© 2025 WeFlow. All rights reserved.</p>
+        <p className="copyright">© 2026 WeFlow. All rights reserved.</p>
 
         <div className="log-toggle-line" style={{ marginTop: '16px', justifyContent: 'center' }}>
           <span style={{ fontSize: '13px', opacity: 0.7 }}>匿名数据收集</span>
@@ -2462,6 +4089,82 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       </div>
     </div>
   )
+
+  const renderUpdatesTab = () => {
+    const downloadPercent = Math.max(0, Math.min(100, Number(downloadProgress?.percent || 0)))
+    const channelCards: { id: configService.UpdateChannel; title: string; desc: string }[] = [
+      { id: 'stable', title: '稳定版', desc: '正式发布的版本，适合日常使用' },
+      { id: 'preview', title: '预览版', desc: '正式发布前的预览体验版本' },
+      { id: 'dev', title: '开发版', desc: '即刻体验我们的屎山代码' }
+    ]
+
+    return (
+      <div className="tab-content updates-tab">
+        <div className="updates-hero">
+          <div className="updates-hero-main">
+            <span className="updates-chip">当前版本</span>
+            <h2>{appVersion || '...'}</h2>
+            <p>{updateInfo?.hasUpdate ? `发现新版本 v${updateInfo.version}` : '当前已是最新版本，可手动检查更新'}</p>
+          </div>
+          <div className="updates-hero-action">
+            {updateInfo?.hasUpdate ? (
+              <button className="btn btn-primary" onClick={() => setShowUpdateDialog(true)}>
+                <Download size={16} /> 立即更新
+              </button>
+            ) : (
+              <button className="btn btn-secondary" onClick={handleCheckUpdate} disabled={isCheckingUpdate}>
+                <RefreshCw size={16} className={isCheckingUpdate ? 'spin' : ''} />
+                {isCheckingUpdate ? '检查中...' : '检查更新'}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {(isDownloading || updateInfo?.hasUpdate) && (
+          <div className="updates-progress-card">
+            <div className="updates-progress-header">
+              <h3>{isDownloading ? `正在下载 v${updateInfo?.version || ''}` : `新版本 v${updateInfo?.version} 已就绪`}</h3>
+              {isDownloading ? <strong>{downloadPercent.toFixed(0)}%</strong> : <span>可立即安装</span>}
+            </div>
+            <div className="updates-progress-track">
+              <div className="updates-progress-fill" style={{ width: `${isDownloading ? downloadPercent : 100}%` }} />
+            </div>
+            {updateInfo?.hasUpdate && !isDownloading && (
+              <button className="btn btn-secondary updates-ignore-btn" onClick={handleIgnoreUpdate}>
+                暂不提醒此版本
+              </button>
+            )}
+          </div>
+        )}
+
+        <div className="updates-card">
+          <div className="updates-card-header">
+            <h3>更新渠道</h3>
+            <span>切换渠道后会自动重新检查</span>
+          </div>
+          <div className="update-channel-grid">
+            {channelCards.map((channel) => {
+              const active = updateChannel === channel.id
+              return (
+                <button
+                  key={channel.id}
+                  className={`update-channel-card ${active ? 'active' : ''}`}
+                  onClick={() => void handleUpdateChannelChange(channel.id)}
+                  disabled={active}
+                >
+                  <div className="update-channel-title-row">
+                    <span className="title">{channel.title}</span>
+                    {active && <Check size={16} />}
+                  </div>
+                  <span className="desc">{channel.desc}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className={`settings-modal-overlay ${isClosing ? 'closing' : ''}`} onClick={handleClose}>
@@ -2510,9 +4213,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
             <h1>设置</h1>
           </div>
           <div className="settings-actions">
-            <button className="btn btn-secondary" onClick={handleTestConnection} disabled={isLoading || isTesting}>
-              <Plug size={16} /> {isTesting ? '测试中...' : '测试连接'}
-            </button>
             {onClose && (
               <button type="button" className="settings-close-btn" onClick={handleClose} aria-label="关闭设置">
                 <X size={18} />
@@ -2533,15 +4233,47 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 <span>{tab.label}</span>
               </button>
             ))}
+
+            <div className={`tab-group ${aiGroupExpanded ? 'expanded' : ''}`}>
+              <button
+                className={`tab-btn tab-group-trigger ${(activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint') ? 'active' : ''}`}
+                onClick={() => setAiGroupExpanded((prev) => !prev)}
+                aria-expanded={aiGroupExpanded}
+              >
+                <Sparkles size={16} />
+                <span>AI 相关</span>
+                <ChevronDown size={14} className={`tab-group-arrow ${aiGroupExpanded ? 'expanded' : ''}`} />
+              </button>
+              <div className={`tab-sublist-wrap ${aiGroupExpanded ? 'expanded' : 'collapsed'}`}>
+                <div className="tab-sublist">
+                  {aiTabs.map((tab) => (
+                    <button
+                      key={tab.id}
+                      className={`tab-btn tab-sub-btn ${activeTab === tab.id ? 'active' : ''}`}
+                      onClick={() => setActiveTab(tab.id)}
+                      tabIndex={aiGroupExpanded ? 0 : -1}
+                    >
+                      <span className="tab-sub-dot" />
+                      <span>{tab.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
           </div>
 
           <div className="settings-body">
             {activeTab === 'appearance' && renderAppearanceTab()}
             {activeTab === 'notification' && renderNotificationTab()}
+            {activeTab === 'antiRevoke' && renderAntiRevokeTab()}
             {activeTab === 'database' && renderDatabaseTab()}
             {activeTab === 'models' && renderModelsTab()}
             {activeTab === 'cache' && renderCacheTab()}
             {activeTab === 'api' && renderApiTab()}
+            {activeTab === 'aiCommon' && renderAiCommonTab()}
+            {activeTab === 'insight' && renderInsightTab()}
+            {activeTab === 'aiFootprint' && renderAiFootprintTab()}
+            {activeTab === 'updates' && renderUpdatesTab()}
             {activeTab === 'analytics' && renderAnalyticsTab()}
             {activeTab === 'security' && renderSecurityTab()}
             {activeTab === 'about' && renderAboutTab()}

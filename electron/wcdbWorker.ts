@@ -80,6 +80,9 @@ if (parentPort) {
                 case 'getMessagesByType':
                     result = await core.getMessagesByType(payload.sessionId, payload.localType, payload.ascending, payload.limit, payload.offset)
                     break
+                case 'getMediaStream':
+                    result = await core.getMediaStream(payload.options)
+                    break
                 case 'getDisplayNames':
                     result = await core.getDisplayNames(payload.usernames)
                     break
@@ -155,6 +158,9 @@ if (parentPort) {
                 case 'getGroupStats':
                     result = await core.getGroupStats(payload.chatroomId, payload.beginTimestamp, payload.endTimestamp)
                     break
+                case 'getMyFootprintStats':
+                    result = await core.getMyFootprintStats(payload.options || {})
+                    break
                 case 'openMessageCursor':
                     result = await core.openMessageCursor(payload.sessionId, payload.batchSize, payload.ascending, payload.beginTimestamp, payload.endTimestamp)
                     break
@@ -229,6 +235,15 @@ if (parentPort) {
                     break
                 case 'getSnsExportStats':
                     result = await core.getSnsExportStats(payload.myWxid)
+                    break
+                case 'checkMessageAntiRevokeTriggers':
+                    result = await core.checkMessageAntiRevokeTriggers(payload.sessionIds)
+                    break
+                case 'installMessageAntiRevokeTriggers':
+                    result = await core.installMessageAntiRevokeTriggers(payload.sessionIds)
+                    break
+                case 'uninstallMessageAntiRevokeTriggers':
+                    result = await core.uninstallMessageAntiRevokeTriggers(payload.sessionIds)
                     break
                 case 'installSnsBlockDeleteTrigger':
                     result = await core.installSnsBlockDeleteTrigger()

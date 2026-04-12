@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Link, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture } from 'lucide-react'
-import { useNavigate } from 'react-router-dom'
+import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture, Newspaper } from 'lucide-react'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { createPortal } from 'react-dom'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { useShallow } from 'zustand/react/shallow'
@@ -16,6 +16,7 @@ import JumpToDatePopover from '../components/JumpToDatePopover'
 import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
 import { type ContactSnsTimelineTarget, isSingleContactSession } from '../components/Sns/contactSnsTimeline'
 import * as configService from '../services/config'
+import BizPage, { BizAccountList, BizMessageArea, BizAccount } from './BizPage'
 import {
   finishBackgroundTask,
   isBackgroundTaskCancelRequested,
@@ -36,11 +37,19 @@ const SYSTEM_MESSAGE_TYPES = [
   266287972401, // 拍一拍
 ]
 
+const OFFICIAL_ACCOUNTS_VIRTUAL_ID = 'official_accounts_virtual'
+
 interface PendingInSessionSearchPayload {
   sessionId: string
   keyword: string
   firstMsgTime: number
   results: Message[]
+}
+
+interface PendingFootprintJumpPayload {
+  sessionId: string
+  localId: number
+  createTime: number
 }
 
 type GlobalMsgSearchPhase = 'idle' | 'seed' | 'backfill' | 'done'
@@ -61,6 +70,24 @@ const GLOBAL_MSG_LEGACY_CONCURRENCY = 6
 const GLOBAL_MSG_SEARCH_CANCELED_ERROR = '__WEFLOW_GLOBAL_MSG_SEARCH_CANCELED__'
 const GLOBAL_MSG_SHADOW_COMPARE_SAMPLE_RATE = 0.2
 const GLOBAL_MSG_SHADOW_COMPARE_STORAGE_KEY = 'weflow.debug.searchShadowCompare'
+const MESSAGE_LIST_SCROLL_IDLE_MS = 160
+const MESSAGE_TOP_WHEEL_LOAD_COOLDOWN_MS = 160
+const MESSAGE_EDGE_TRIGGER_DISTANCE_PX = 96
+
+type RequestIdleCallbackCompat = (callback: () => void, options?: { timeout?: number }) => number
+
+function scheduleWhenIdle(task: () => void, options?: { timeout?: number; fallbackDelay?: number }): void {
+  const requestIdleCallbackFn = (
+    globalThis as typeof globalThis & { requestIdleCallback?: RequestIdleCallbackCompat }
+  ).requestIdleCallback
+
+  if (typeof requestIdleCallbackFn === 'function') {
+    requestIdleCallbackFn(task, options?.timeout !== undefined ? { timeout: options.timeout } : undefined)
+    return
+  }
+
+  window.setTimeout(task, options?.fallbackDelay ?? 0)
+}
 
 function isGlobalMsgSearchCanceled(error: unknown): boolean {
   return String(error || '') === GLOBAL_MSG_SEARCH_CANCELED_ERROR
@@ -154,6 +181,51 @@ function buildChatRecordPreviewItems(recordList: ChatRecordItem[], maxVisible = 
   ]
 }
 
+interface SolitaireEntry {
+  index: string
+  text: string
+}
+
+interface SolitaireContent {
+  title: string
+  introLines: string[]
+  entries: SolitaireEntry[]
+}
+
+function parseSolitaireContent(rawTitle: string): SolitaireContent {
+  const lines = String(rawTitle || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+
+  const title = lines[0] || '接龙'
+  const introLines: string[] = []
+  const entries: SolitaireEntry[] = []
+  let hasStartedEntries = false
+
+  for (const line of lines.slice(1)) {
+    const entryMatch = /^(\d+)[.．、]\s*(.+)$/.exec(line)
+    if (entryMatch) {
+      hasStartedEntries = true
+      entries.push({
+        index: entryMatch[1],
+        text: entryMatch[2].trim()
+      })
+      continue
+    }
+
+    if (hasStartedEntries && entries.length > 0) {
+      const previous = entries[entries.length - 1]
+      previous.text = `${previous.text} ${line}`.trim()
+    } else {
+      introLines.push(line)
+    }
+  }
+
+  return { title, introLines, entries }
+}
+
 function composeGlobalMsgSearchResults(
   seedMap: Map<string, GlobalMsgSearchResult[]>,
   authoritativeMap: Map<string, GlobalMsgSearchResult[]>
@@ -205,6 +277,12 @@ function sortMessagesByCreateTimeDesc<T extends Pick<Message, 'createTime' | 'lo
     if (timeDiff !== 0) return timeDiff
     return (b.localId || 0) - (a.localId || 0)
   })
+}
+
+function isRenderableImageSrc(value?: string | null): boolean {
+  const src = String(value || '').trim()
+  if (!src) return false
+  return /^(https?:\/\/|data:image\/|blob:|file:\/\/|\/)/i.test(src)
 }
 
 function normalizeSearchIdentityText(value?: string | null): string | undefined {
@@ -983,6 +1061,7 @@ const SessionItem = React.memo(function SessionItem({
   )
 
   const isFoldEntry = session.username.toLowerCase().includes('placeholder_foldgroup')
+  const isBizEntry = session.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID
 
   // 折叠入口：专属名称和图标
   if (isFoldEntry) {
@@ -1001,6 +1080,36 @@ const SessionItem = React.memo(function SessionItem({
           </div>
           <div className="session-bottom">
             <span className="session-summary">{session.summary || '暂无消息'}</span>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // 公众号入口：专属名称和图标
+  if (isBizEntry) {
+    return (
+      <div
+        className={`session-item biz-entry ${isActive ? 'active' : ''}`}
+        onClick={() => onSelect(session)}
+      >
+        <div className="biz-entry-avatar">
+          <Newspaper size={22} />
+        </div>
+        <div className="session-info">
+          <div className="session-top">
+            <span className="session-name">订阅号/服务号</span>
+            <span className="session-time">{timeText}</span>
+          </div>
+          <div className="session-bottom">
+            <span className="session-summary">{session.summary || '查看公众号历史消息'}</span>
+            <div className="session-badges">
+              {session.unreadCount > 0 && (
+                <span className="unread-badge">
+                  {session.unreadCount > 99 ? '99+' : session.unreadCount}
+                </span>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -1091,6 +1200,7 @@ function ChatPage(props: ChatPageProps) {
   const normalizedStandaloneInitialContactType = useMemo(() => String(standaloneInitialContactType || '').trim().toLowerCase(), [standaloneInitialContactType])
   const shouldHideStandaloneDetailButton = standaloneSessionWindow && normalizedStandaloneSource === 'export'
   const navigate = useNavigate()
+  const location = useLocation()
 
   const {
     isConnected,
@@ -1152,7 +1262,12 @@ function ChatPage(props: ChatPageProps) {
   const visibleMessageRangeRef = useRef<{ startIndex: number; endIndex: number }>({ startIndex: 0, endIndex: 0 })
   const topRangeLoadLockRef = useRef(false)
   const bottomRangeLoadLockRef = useRef(false)
+  const topRangeLoadLastTriggerAtRef = useRef(0)
   const suppressAutoLoadLaterRef = useRef(false)
+  const suppressAutoScrollOnNextMessageGrowthRef = useRef(false)
+  const prependingHistoryRef = useRef(false)
+  const isMessageListScrollingRef = useRef(false)
+  const messageListScrollTimeoutRef = useRef<number | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const sidebarRef = useRef<HTMLDivElement>(null)
   const handleMessageListScrollParentRef = useCallback((node: HTMLDivElement | null) => {
@@ -1204,6 +1319,8 @@ function ChatPage(props: ChatPageProps) {
   const [highlightedMessageKeys, setHighlightedMessageKeys] = useState<string[]>([])
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false)
   const [foldedView, setFoldedView] = useState(false) // 是否在"折叠的群聊"视图
+  const [bizView, setBizView] = useState(false) // 是否在"公众号"视图
+  const [selectedBizAccount, setSelectedBizAccount] = useState<BizAccount | null>(null)
   const [hasInitialMessages, setHasInitialMessages] = useState(false)
   const [isSessionSwitching, setIsSessionSwitching] = useState(false)
   const [noMessageTable, setNoMessageTable] = useState(false)
@@ -1304,6 +1421,7 @@ function ChatPage(props: ChatPageProps) {
   const [globalMsgAuthoritativeSessionCount, setGlobalMsgAuthoritativeSessionCount] = useState(0)
   const [globalMsgSearchError, setGlobalMsgSearchError] = useState<string | null>(null)
   const pendingInSessionSearchRef = useRef<PendingInSessionSearchPayload | null>(null)
+  const pendingFootprintJumpRef = useRef<PendingFootprintJumpPayload | null>(null)
   const pendingGlobalMsgSearchReplayRef = useRef<string | null>(null)
   const globalMsgPrefixCacheRef = useRef<GlobalMsgPrefixCacheEntry | null>(null)
 
@@ -1369,6 +1487,18 @@ function ChatPage(props: ChatPageProps) {
       suppressScrollToBottomButtonRef.current = false
       scrollBottomButtonArmTimerRef.current = null
     }, delayMs)
+  }, [])
+
+  const markMessageListScrolling = useCallback(() => {
+    isMessageListScrollingRef.current = true
+    if (messageListScrollTimeoutRef.current !== null) {
+      window.clearTimeout(messageListScrollTimeoutRef.current)
+      messageListScrollTimeoutRef.current = null
+    }
+    messageListScrollTimeoutRef.current = window.setTimeout(() => {
+      isMessageListScrollingRef.current = false
+      messageListScrollTimeoutRef.current = null
+    }, MESSAGE_LIST_SCROLL_IDLE_MS)
   }, [])
 
   const isGroupChatSession = useCallback((username: string) => {
@@ -2691,6 +2821,9 @@ function ChatPage(props: ChatPageProps) {
     setConnected(false)
     setConnecting(false)
     setHasMoreMessages(true)
+    setFoldedView(false)
+    setBizView(false)
+    setSelectedBizAccount(null)
     setHasMoreLater(false)
     const scope = await resolveChatCacheScope()
     hydrateSessionListCache(scope)
@@ -2901,15 +3034,9 @@ function ChatPage(props: ChatPageProps) {
           await loadContactInfoBatch(usernames)
         } else {
           await new Promise<void>((resolve) => {
-            if ('requestIdleCallback' in window) {
-              window.requestIdleCallback(() => {
-                void loadContactInfoBatch(usernames).finally(resolve)
-              }, { timeout: 700 })
-            } else {
-              setTimeout(() => {
-                void loadContactInfoBatch(usernames).finally(resolve)
-              }, 80)
-            }
+            scheduleWhenIdle(() => {
+              void loadContactInfoBatch(usernames).finally(resolve)
+            }, { timeout: 700, fallbackDelay: 80 })
           })
         }
         processedBatchCount += 1
@@ -3008,7 +3135,7 @@ function ChatPage(props: ChatPageProps) {
   const loadContactInfoBatch = async (usernames: string[]) => {
     const startTime = performance.now()
     try {
-      // 在 DLL 调用前让出控制权（使用 setTimeout 0 代替 setImmediate）
+      // 在数据服务调用前让出控制权（使用 setTimeout 0 代替 setImmediate）
       await new Promise(resolve => setTimeout(resolve, 0))
 
       const dllStart = performance.now()
@@ -3019,7 +3146,7 @@ function ChatPage(props: ChatPageProps) {
       }
       const dllTime = performance.now() - dllStart
 
-      // DLL 调用后再次让出控制权
+      //数据服务调用后再次让出控制权
       await new Promise(resolve => setTimeout(resolve, 0))
 
       const totalTime = performance.now() - startTime
@@ -3201,18 +3328,31 @@ function ChatPage(props: ChatPageProps) {
     }
 
     if (defer) {
-      if ('requestIdleCallback' in window) {
-        window.requestIdleCallback(() => {
-          runWarmup()
-        }, { timeout: 1200 })
-      } else {
-        globalThis.setTimeout(runWarmup, 120)
-      }
+      scheduleWhenIdle(runWarmup, { timeout: 1200, fallbackDelay: 120 })
       return
     }
 
     runWarmup()
   }, [loadContactInfoBatch])
+
+  const scheduleGroupSenderWarmup = useCallback((usernames: string[], defer = false) => {
+    if (!Array.isArray(usernames) || usernames.length === 0) return
+    const run = () => warmupGroupSenderProfiles(usernames, false)
+    if (!defer && !isMessageListScrollingRef.current) {
+      run()
+      return
+    }
+
+    const runWhenIdle = () => {
+      if (isMessageListScrollingRef.current) {
+        window.setTimeout(runWhenIdle, MESSAGE_LIST_SCROLL_IDLE_MS)
+        return
+      }
+      run()
+    }
+
+    scheduleWhenIdle(runWhenIdle, { timeout: 1200, fallbackDelay: MESSAGE_LIST_SCROLL_IDLE_MS })
+  }, [warmupGroupSenderProfiles])
 
   // 加载消息
   const loadMessages = async (
@@ -3223,11 +3363,15 @@ function ChatPage(props: ChatPageProps) {
     ascending = false,
     options: LoadMessagesOptions = {}
   ) => {
+    const isPrependHistoryLoad = offset > 0 && !ascending
+    if (isPrependHistoryLoad) {
+      prependingHistoryRef.current = true
+    }
     const listEl = messageListRef.current
     const session = sessionMapRef.current.get(sessionId)
     const unreadCount = session?.unreadCount ?? 0
 
-    let messageLimit = currentBatchSizeRef.current
+    let messageLimit: number
 
     if (offset === 0) {
       const preferredLimit = Number.isFinite(options.forceInitialLimit)
@@ -3256,10 +3400,6 @@ function ChatPage(props: ChatPageProps) {
       Math.max(visibleRange.startIndex, 0),
       Math.max(messages.length - 1, 0)
     )
-    const anchorMessageKeyBeforePrepend = offset > 0 && messages.length > 0
-      ? getMessageKey(messages[visibleStartIndex])
-      : null
-
     // 记录加载前的第一条消息元素（非虚拟列表回退路径）
     const firstMsgEl = listEl?.querySelector('.message-wrapper') as HTMLElement | null
 
@@ -3308,12 +3448,11 @@ function ChatPage(props: ChatPageProps) {
               .map(m => m.senderUsername as string)
             )]
             if (unknownSenders.length > 0) {
-              warmupGroupSenderProfiles(unknownSenders, options.deferGroupSenderWarmup === true)
+              scheduleGroupSenderWarmup(unknownSenders, options.deferGroupSenderWarmup === true)
             }
           }
 
           // 日期跳转时滚动到顶部，否则滚动到底部
-          const loadedMessages = result.messages
           requestAnimationFrame(() => {
             if (isDateJumpRef.current) {
               if (messageVirtuosoRef.current && resultMessages.length > 0) {
@@ -3333,6 +3472,19 @@ function ChatPage(props: ChatPageProps) {
             }
           })
         } else {
+          const existingMessageKeys = messageKeySetRef.current
+          const incomingSeen = new Set<string>()
+          let prependedInsertedCount = 0
+          for (const row of resultMessages) {
+            const key = getMessageKey(row)
+            if (incomingSeen.has(key)) continue
+            incomingSeen.add(key)
+            if (!existingMessageKeys.has(key)) {
+              prependedInsertedCount += 1
+            }
+          }
+
+          suppressAutoScrollOnNextMessageGrowthRef.current = true
           appendMessages(resultMessages, true)
 
           // 加载更多也同样处理发送者信息预取
@@ -3343,24 +3495,20 @@ function ChatPage(props: ChatPageProps) {
               .map(m => m.senderUsername as string)
             )]
             if (unknownSenders.length > 0) {
-              warmupGroupSenderProfiles(unknownSenders, false)
+              scheduleGroupSenderWarmup(unknownSenders, false)
             }
           }
 
           // 加载更早消息后保持视口锚点，避免跳屏
-          const appendedMessages = result.messages
           requestAnimationFrame(() => {
             if (messageVirtuosoRef.current) {
-              if (anchorMessageKeyBeforePrepend) {
-                const latestMessages = useChatStore.getState().messages || []
-                const anchorIndex = latestMessages.findIndex((msg) => getMessageKey(msg) === anchorMessageKeyBeforePrepend)
-                if (anchorIndex >= 0) {
-                  messageVirtuosoRef.current.scrollToIndex({ index: anchorIndex, align: 'start', behavior: 'auto' })
-                  return
-                }
-              }
-              if (resultMessages.length > 0) {
-                messageVirtuosoRef.current.scrollToIndex({ index: resultMessages.length, align: 'start', behavior: 'auto' })
+              const latestMessages = useChatStore.getState().messages || []
+              const anchorIndex = Math.min(
+                Math.max(visibleStartIndex + prependedInsertedCount, 0),
+                Math.max(latestMessages.length - 1, 0)
+              )
+              if (latestMessages.length > 0) {
+                messageVirtuosoRef.current.scrollToIndex({ index: anchorIndex, align: 'start', behavior: 'auto' })
               }
               return
             }
@@ -3400,6 +3548,11 @@ function ChatPage(props: ChatPageProps) {
         setMessages([])
       }
     } finally {
+      if (isPrependHistoryLoad) {
+        requestAnimationFrame(() => {
+          prependingHistoryRef.current = false
+        })
+      }
       setLoadingMessages(false)
       setLoadingMore(false)
       if (offset === 0 && pendingSessionLoadRef.current === sessionId) {
@@ -3430,9 +3583,11 @@ function ChatPage(props: ChatPageProps) {
     setCurrentOffset(0)
     setJumpStartTime(0)
     setJumpEndTime(end)
+    suppressAutoLoadLaterRef.current = true
     setShowJumpPopover(false)
     void loadMessages(targetSessionId, 0, 0, end, false, {
-      switchRequestSeq: options.switchRequestSeq
+      switchRequestSeq: options.switchRequestSeq,
+      forceInitialLimit: 120
     })
   }, [currentSessionId, loadMessages])
 
@@ -3964,6 +4119,12 @@ function ChatPage(props: ChatPageProps) {
       setFoldedView(true)
       return
     }
+    // 点击公众号入口，切换到公众号视图
+    if (session.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID) {
+      setBizView(true)
+      setSelectedBizAccount(null) // 切入时默认不选中任何公众号
+      return
+    }
     selectSessionById(session.username)
   }
 
@@ -4342,36 +4503,6 @@ function ChatPage(props: ChatPageProps) {
       return
     }
 
-    if (range.endIndex >= Math.max(total - 2, 0)) {
-      isMessageListAtBottomRef.current = true
-      setShowScrollToBottom(prev => (prev ? false : prev))
-    }
-
-    if (
-      range.startIndex <= 2 &&
-      !topRangeLoadLockRef.current &&
-      !isLoadingMore &&
-      !isLoadingMessages &&
-      hasMoreMessages &&
-      currentSessionId
-    ) {
-      topRangeLoadLockRef.current = true
-      void loadMessages(currentSessionId, currentOffset, jumpStartTime, jumpEndTime)
-    }
-
-    if (
-      range.endIndex >= total - 3 &&
-      !bottomRangeLoadLockRef.current &&
-      !suppressAutoLoadLaterRef.current &&
-      !isLoadingMore &&
-      !isLoadingMessages &&
-      hasMoreLater &&
-      currentSessionId
-    ) {
-      bottomRangeLoadLockRef.current = true
-      void loadLaterMessages()
-    }
-
     if (shouldWarmupVisibleGroupSenders) {
       const now = Date.now()
       if (now - lastVisibleSenderWarmupAtRef.current >= 180) {
@@ -4390,27 +4521,18 @@ function ChatPage(props: ChatPageProps) {
           if (pendingUsernames.size >= 24) break
         }
         if (pendingUsernames.size > 0) {
-          warmupGroupSenderProfiles([...pendingUsernames], false)
+          scheduleGroupSenderWarmup([...pendingUsernames], false)
         }
       }
     }
   }, [
     messages.length,
-    isLoadingMore,
-    isLoadingMessages,
-    hasMoreMessages,
-    hasMoreLater,
     currentSessionId,
-    currentOffset,
-    jumpStartTime,
-    jumpEndTime,
     isGroupChatSession,
     standaloneSessionWindow,
     normalizedInitialSessionId,
     normalizedStandaloneInitialContactType,
-    warmupGroupSenderProfiles,
-    loadMessages,
-    loadLaterMessages
+    scheduleGroupSenderWarmup
   ])
 
   const handleMessageAtBottomStateChange = useCallback((atBottom: boolean) => {
@@ -4424,9 +4546,8 @@ function ChatPage(props: ChatPageProps) {
     const distanceFromBottom = listEl
       ? (listEl.scrollHeight - (listEl.scrollTop + listEl.clientHeight))
       : Number.POSITIVE_INFINITY
-    const nearBottomByRange = visibleMessageRangeRef.current.endIndex >= Math.max(messages.length - 2, 0)
     const nearBottomByDistance = distanceFromBottom <= 140
-    const effectiveAtBottom = atBottom || nearBottomByRange || nearBottomByDistance
+    const effectiveAtBottom = atBottom || nearBottomByDistance
     isMessageListAtBottomRef.current = effectiveAtBottom
 
     if (!effectiveAtBottom) {
@@ -4454,19 +4575,48 @@ function ChatPage(props: ChatPageProps) {
   }, [messages.length, isLoadingMessages, isLoadingMore, isSessionSwitching])
 
   const handleMessageListWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
-    if (event.deltaY <= 18) return
-    if (!currentSessionId || isLoadingMore || isLoadingMessages || !hasMoreLater) return
+    markMessageListScrolling()
+    if (!currentSessionId || isLoadingMore || isLoadingMessages) return
     const listEl = messageListRef.current
     if (!listEl) return
+    const distanceFromTop = listEl.scrollTop
     const distanceFromBottom = listEl.scrollHeight - (listEl.scrollTop + listEl.clientHeight)
-    if (distanceFromBottom > 96) return
+
+    if (event.deltaY <= -18) {
+      if (!hasMoreMessages) return
+      if (distanceFromTop > MESSAGE_EDGE_TRIGGER_DISTANCE_PX) return
+      if (topRangeLoadLockRef.current) return
+      const now = Date.now()
+      if (now - topRangeLoadLastTriggerAtRef.current < MESSAGE_TOP_WHEEL_LOAD_COOLDOWN_MS) return
+      topRangeLoadLastTriggerAtRef.current = now
+      topRangeLoadLockRef.current = true
+      isMessageListAtBottomRef.current = false
+      void loadMessages(currentSessionId, currentOffset, jumpStartTime, jumpEndTime)
+      return
+    }
+
+    if (event.deltaY <= 18) return
+    if (!hasMoreLater) return
+    if (distanceFromBottom > MESSAGE_EDGE_TRIGGER_DISTANCE_PX) return
     if (bottomRangeLoadLockRef.current) return
 
     // 用户明确向下滚动时允许加载后续消息
     suppressAutoLoadLaterRef.current = false
     bottomRangeLoadLockRef.current = true
     void loadLaterMessages()
-  }, [currentSessionId, hasMoreLater, isLoadingMessages, isLoadingMore, loadLaterMessages])
+  }, [
+    currentSessionId,
+    hasMoreLater,
+    hasMoreMessages,
+    isLoadingMessages,
+    isLoadingMore,
+    currentOffset,
+    jumpStartTime,
+    jumpEndTime,
+    markMessageListScrolling,
+    loadMessages,
+    loadLaterMessages
+  ])
 
   const handleMessageAtTopStateChange = useCallback((atTop: boolean) => {
     if (!atTop) {
@@ -4621,6 +4771,11 @@ function ChatPage(props: ChatPageProps) {
       if (sessionScrollTimeoutRef.current) {
         clearTimeout(sessionScrollTimeoutRef.current)
       }
+      if (messageListScrollTimeoutRef.current !== null) {
+        window.clearTimeout(messageListScrollTimeoutRef.current)
+        messageListScrollTimeoutRef.current = null
+      }
+      isMessageListScrollingRef.current = false
       contactUpdateQueueRef.current.clear()
       pendingSessionContactEnrichRef.current.clear()
       sessionContactEnrichAttemptAtRef.current.clear()
@@ -4661,8 +4816,12 @@ function ChatPage(props: ChatPageProps) {
     lastObservedMessageCountRef.current = currentCount
     if (currentCount <= previousCount) return
     if (!currentSessionId || isLoadingMessages || isSessionSwitching) return
-    const wasNearBottomByRange = visibleMessageRangeRef.current.endIndex >= Math.max(previousCount - 2, 0)
-    if (!isMessageListAtBottomRef.current && !wasNearBottomByRange) return
+    if (suppressAutoScrollOnNextMessageGrowthRef.current || prependingHistoryRef.current) {
+      suppressAutoScrollOnNextMessageGrowthRef.current = false
+      return
+    }
+    if (!isMessageListAtBottomRef.current) return
+    if (suppressAutoLoadLaterRef.current) return
     suppressScrollToBottomButton(220)
     isMessageListAtBottomRef.current = true
     requestAnimationFrame(() => {
@@ -4942,18 +5101,47 @@ function ChatPage(props: ChatPageProps) {
       return []
     }
 
+    const officialSessions = sessions.filter(s => s.username.startsWith('gh_'))
+
     // 检查是否有折叠的群聊
     const foldedGroups = sessions.filter(s => s.isFolded && !s.username.toLowerCase().includes('placeholder_foldgroup'))
     const hasFoldedGroups = foldedGroups.length > 0
 
-    const visible = sessions.filter(s => {
+    let visible = sessions.filter(s => {
       if (s.isFolded && !s.username.toLowerCase().includes('placeholder_foldgroup')) return false
+      if (s.username.startsWith('gh_')) return false
       return true
     })
 
-    // 如果有折叠的群聊，但列表中没有入口，则插入入口
+    const latestOfficial = officialSessions.reduce<ChatSession | null>((latest, current) => {
+      if (!latest) return current
+      const latestTime = latest.sortTimestamp || latest.lastTimestamp
+      const currentTime = current.sortTimestamp || current.lastTimestamp
+      return currentTime > latestTime ? current : latest
+    }, null)
+    const officialUnreadCount = officialSessions.reduce((sum, s) => sum + (s.unreadCount || 0), 0)
+
+    const bizEntry: ChatSession = {
+      username: OFFICIAL_ACCOUNTS_VIRTUAL_ID,
+      displayName: '公众号',
+      summary: latestOfficial
+        ? `${latestOfficial.displayName || latestOfficial.username}: ${latestOfficial.summary || '查看公众号历史消息'}`
+        : '查看公众号历史消息',
+      type: 0,
+      sortTimestamp: 9999999999,  // 放到最前面？  目前还没有严格的对时间进行排序，  后面可以改一下
+      lastTimestamp: latestOfficial?.lastTimestamp || latestOfficial?.sortTimestamp || 0,
+      lastMsgType: latestOfficial?.lastMsgType || 0,
+      unreadCount: officialUnreadCount,
+      isMuted: false,
+      isFolded: false
+    }
+
+    if (!visible.some(s => s.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID)) {
+      visible.unshift(bizEntry)
+    }
+
     if (hasFoldedGroups && !visible.some(s => s.username.toLowerCase().includes('placeholder_foldgroup'))) {
-      // 找到最新的折叠消息
+
       const latestFolded = foldedGroups.reduce((latest, current) => {
         const latestTime = latest.sortTimestamp || latest.lastTimestamp
         const currentTime = current.sortTimestamp || current.lastTimestamp
@@ -5234,6 +5422,90 @@ function ChatPage(props: ChatPageProps) {
     standaloneInitialLoadRequested,
     selectSessionById
   ])
+
+  // 监听 URL 参数中的会话/锚点（通知跳转 + 足迹锚点定位）
+  useEffect(() => {
+    if (standaloneSessionWindow) return // standalone模式由上面的useEffect处理
+    const params = new URLSearchParams(location.search)
+    const urlSessionId = String(params.get('sessionId') || '').trim()
+    if (!urlSessionId) return
+    if (!isConnected || isConnecting) return
+    const jumpSource = String(params.get('jumpSource') || '').trim()
+    const jumpLocalId = Number.parseInt(String(params.get('jumpLocalId') || ''), 10)
+    const jumpCreateTime = Number.parseInt(String(params.get('jumpCreateTime') || ''), 10)
+    const hasFootprintAnchor = jumpSource === 'footprint'
+      && Number.isFinite(jumpLocalId)
+      && jumpLocalId > 0
+      && Number.isFinite(jumpCreateTime)
+      && jumpCreateTime > 0
+
+    if (hasFootprintAnchor) {
+      pendingFootprintJumpRef.current = {
+        sessionId: urlSessionId,
+        localId: jumpLocalId,
+        createTime: jumpCreateTime
+      }
+      if (currentSessionId !== urlSessionId) {
+        selectSessionById(urlSessionId)
+        return
+      }
+      const messageStub: Message = {
+        messageKey: `footprint:${urlSessionId}:${jumpCreateTime}:${jumpLocalId}`,
+        localId: jumpLocalId,
+        serverId: 0,
+        localType: 0,
+        createTime: jumpCreateTime,
+        sortSeq: jumpCreateTime,
+        isSend: null,
+        senderUsername: null,
+        parsedContent: '',
+        rawContent: ''
+      }
+      handleInSessionResultJump(messageStub)
+      pendingFootprintJumpRef.current = null
+      navigate('/chat', { replace: true })
+      return
+    }
+
+    pendingFootprintJumpRef.current = null
+    if (currentSessionId !== urlSessionId) {
+      selectSessionById(urlSessionId)
+    }
+    // 选中后清除URL参数，避免影响后续用户手动切换会话
+    navigate('/chat', { replace: true })
+  }, [
+    standaloneSessionWindow,
+    location.search,
+    isConnected,
+    isConnecting,
+    currentSessionId,
+    selectSessionById,
+    handleInSessionResultJump,
+    navigate
+  ])
+
+  useEffect(() => {
+    const pending = pendingFootprintJumpRef.current
+    if (!pending) return
+    if (!isConnected || isConnecting) return
+    if (currentSessionId !== pending.sessionId) return
+
+    const messageStub: Message = {
+      messageKey: `footprint:${pending.sessionId}:${pending.createTime}:${pending.localId}`,
+      localId: pending.localId,
+      serverId: 0,
+      localType: 0,
+      createTime: pending.createTime,
+      sortSeq: pending.createTime,
+      isSend: null,
+      senderUsername: null,
+      parsedContent: '',
+      rawContent: ''
+    }
+    handleInSessionResultJump(messageStub)
+    pendingFootprintJumpRef.current = null
+    navigate('/chat', { replace: true })
+  }, [isConnected, isConnecting, currentSessionId, handleInSessionResultJump, navigate])
 
   useEffect(() => {
     if (!standaloneSessionWindow || !normalizedInitialSessionId) return
@@ -6031,7 +6303,7 @@ function ChatPage(props: ChatPageProps) {
         ref={sidebarRef}
         style={{ width: sidebarWidth, minWidth: sidebarWidth, maxWidth: sidebarWidth }}
       >
-        <div className={`session-header session-header-viewport ${foldedView ? 'folded' : ''}`}>
+        <div className={`session-header session-header-viewport ${foldedView || bizView ? 'folded' : ''}`}>
           {/* 普通 header */}
           <div className="session-header-panel main-header">
             <div className="search-row">
@@ -6061,12 +6333,18 @@ function ChatPage(props: ChatPageProps) {
           {/* 折叠群 header */}
           <div className="session-header-panel folded-header">
             <div className="folded-view-header">
-              <button className="icon-btn back-btn" onClick={() => setFoldedView(false)}>
+              <button className="icon-btn back-btn" onClick={() => {
+                setFoldedView(false)
+                setBizView(false)
+              }}>
                 <ChevronLeft size={18} />
               </button>
               <span className="folded-view-title">
-                <Users size={14} />
-                折叠的群聊
+                {foldedView ? (
+                    <><Users size={14} /> 折叠的群聊</>
+                ) : bizView ? (
+                    <><Newspaper size={14} /> 订阅号/服务号</>
+                ) : null}
               </span>
             </div>
           </div>
@@ -6173,7 +6451,7 @@ function ChatPage(props: ChatPageProps) {
             ))}
           </div>
         ) : (
-          <div className={`session-list-viewport ${foldedView ? 'folded' : ''}`}>
+          <div className={`session-list-viewport ${foldedView || bizView ? 'folded' : ''}`}>
             {/* 普通会话列表 */}
             <div className="session-list-panel main-panel">
               {Array.isArray(filteredSessions) && filteredSessions.length > 0 ? (
@@ -6199,7 +6477,7 @@ function ChatPage(props: ChatPageProps) {
                     <SessionItem
                       key={session.username}
                       session={session}
-                      isActive={currentSessionId === session.username}
+                      isActive={currentSessionId === session.username || (bizView && session.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID)}
                       onSelect={handleSelectSession}
                       formatTime={formatSessionTime}
                       searchKeyword={searchKeyword}
@@ -6218,24 +6496,36 @@ function ChatPage(props: ChatPageProps) {
 
             {/* 折叠群列表 */}
             <div className="session-list-panel folded-panel">
-              {foldedSessions.length > 0 ? (
-                <div className="session-list">
-                  {foldedSessions.map(session => (
-                    <SessionItem
-                      key={session.username}
-                      session={session}
-                      isActive={currentSessionId === session.username}
-                      onSelect={handleSelectSession}
-                      formatTime={formatSessionTime}
-                      searchKeyword={searchKeyword}
+              {foldedView && (
+                  foldedSessions.length > 0 ? (
+                      <div className="session-list">
+                        {foldedSessions.map(session => (
+                            <SessionItem
+                                key={session.username}
+                                session={session}
+                                isActive={currentSessionId === session.username || (bizView && session.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID)}
+                                onSelect={handleSelectSession}
+                                formatTime={formatSessionTime}
+                                searchKeyword={searchKeyword}
+                            />
+                        ))}
+                      </div>
+                  ) : (
+                      <div className="empty-sessions">
+                        <Users size={32} />
+                        <p>没有折叠的群聊</p>
+                      </div>
+                  )
+              )}
+
+              {bizView && (
+                  <div style={{ height: '100%', overflowY: 'auto' }}>
+                    <BizAccountList
+                        onSelect={setSelectedBizAccount}
+                        selectedUsername={selectedBizAccount?.username}
+                        searchKeyword={searchKeyword}
                     />
-                  ))}
-                </div>
-              ) : (
-                <div className="empty-sessions">
-                  <Users size={32} />
-                  <p>没有折叠的群聊</p>
-                </div>
+                  </div>
               )}
             </div>
           </div>
@@ -6247,9 +6537,11 @@ function ChatPage(props: ChatPageProps) {
 
       {/* 右侧消息区域 */}
       <div className="message-area">
-        {currentSession ? (
-          <>
-            <div className="message-header">
+        {bizView ? (
+            <BizMessageArea account={selectedBizAccount} />
+        ) : currentSession ? (
+            <>
+              <div className="message-header">
               <Avatar
                 src={currentSession.avatarUrl}
                 name={currentSession.displayName || currentSession.username}
@@ -6529,6 +6821,7 @@ function ChatPage(props: ChatPageProps) {
               <div
                 className={`message-list ${hasInitialMessages ? 'loaded' : 'loading'}`}
                 ref={handleMessageListScrollParentRef}
+                onScroll={markMessageListScrolling}
                 onWheel={handleMessageListWheel}
               >
                 {!isLoadingMessages && messages.length === 0 && !hasMoreMessages ? (
@@ -6542,8 +6835,12 @@ function ChatPage(props: ChatPageProps) {
                     className="message-virtuoso"
                     customScrollParent={messageListScrollParent ?? undefined}
                     data={messages}
-                    overscan={360}
-                    followOutput={(atBottom) => (atBottom || isMessageListAtBottomRef.current ? 'auto' : false)}
+                    overscan={220}
+                    followOutput={(atBottom) => (
+                      prependingHistoryRef.current
+                        ? false
+                        : (atBottom && isMessageListAtBottomRef.current ? 'auto' : false)
+                    )}
                     atBottomThreshold={80}
                     atBottomStateChange={handleMessageAtBottomStateChange}
                     atTopStateChange={handleMessageAtTopStateChange}
@@ -6655,13 +6952,7 @@ function ChatPage(props: ChatPageProps) {
 
               {/* 会话详情面板 */}
               {showDetailPanel && (
-                <div className="detail-panel">
-                  <div className="detail-header">
-                    <h4>会话详情</h4>
-                    <button className="close-btn" onClick={() => setShowDetailPanel(false)}>
-                      <X size={16} />
-                    </button>
-                  </div>
+                <div className="detail-panel session-detail-panel">
                   {isLoadingDetail && !sessionDetail ? (
                     <div className="detail-loading">
                       <Loader2 size={20} className="spin" />
@@ -6669,7 +6960,27 @@ function ChatPage(props: ChatPageProps) {
                     </div>
                   ) : sessionDetail ? (
                     <div className="detail-content">
-                      <div className="detail-section">
+                      <div className="detail-overview-card">
+                        <Avatar
+                          src={currentSession?.avatarUrl}
+                          name={sessionDetail.remark || sessionDetail.nickName || currentSession?.displayName || sessionDetail.wxid}
+                          size={42}
+                          className="detail-overview-avatar"
+                        />
+                        <div className="detail-overview-meta">
+                          <span className="detail-overview-name">
+                            {sessionDetail.remark || sessionDetail.nickName || currentSession?.displayName || sessionDetail.alias || sessionDetail.wxid}
+                          </span>
+                          <span className="detail-overview-sub">
+                            {sessionDetail.alias || sessionDetail.wxid}
+                          </span>
+                        </div>
+                        <button className="detail-overview-close-btn" onClick={() => setShowDetailPanel(false)} title="关闭详情">
+                          <X size={16} />
+                        </button>
+                      </div>
+
+                      <div className="detail-section detail-basic-section">
                         <div className="detail-item">
                           <Hash size={14} />
                           <span className="label">微信ID</span>
@@ -6707,10 +7018,10 @@ function ChatPage(props: ChatPageProps) {
                         )}
                       </div>
 
-                      <div className="detail-section">
+                      <div className="detail-section detail-stats-section">
                         <div className="section-title">
                           <MessageSquare size={14} />
-                          <span>消息统计（导出口径）</span>
+                          <span>消息统计</span>
                         </div>
                         <div className="detail-stats-meta">
                           {isRefreshingDetailStats
@@ -6868,7 +7179,7 @@ function ChatPage(props: ChatPageProps) {
                         </div>
                       </div>
 
-                      <div className="detail-section">
+                      <div className="detail-section detail-db-section">
                         <div className="section-title">
                           <Database size={14} />
                           <span>数据库分布</span>
@@ -7559,6 +7870,7 @@ function MessageBubble({
   const [senderName, setSenderName] = useState<string | undefined>(undefined)
   const [quotedSenderName, setQuotedSenderName] = useState<string | undefined>(undefined)
   const [quoteLayout, setQuoteLayout] = useState<QuoteLayout>('quote-top')
+  const [solitaireExpanded, setSolitaireExpanded] = useState(false)
   const senderProfileRequestSeqRef = useRef(0)
   const [emojiError, setEmojiError] = useState(false)
   const [emojiLoading, setEmojiLoading] = useState(false)
@@ -7585,6 +7897,8 @@ function MessageBubble({
   // State variables...
   const [imageError, setImageError] = useState(false)
   const [imageLoading, setImageLoading] = useState(false)
+  const [imageLoaded, setImageLoaded] = useState(false)
+  const [imageStageLockHeight, setImageStageLockHeight] = useState<number | null>(null)
   const [imageHasUpdate, setImageHasUpdate] = useState(false)
   const [imageClicked, setImageClicked] = useState(false)
   const imageUpdateCheckedRef = useRef<string | null>(null)
@@ -7630,6 +7944,11 @@ function MessageBubble({
   const videoContainerRef = useRef<HTMLElement>(null)
   const [isVideoVisible, setIsVideoVisible] = useState(false)
   const [videoMd5, setVideoMd5] = useState<string | null>(null)
+  const imageStageLockStyle = useMemo<React.CSSProperties | undefined>(() => (
+    imageStageLockHeight && imageStageLockHeight > 0
+      ? { height: `${Math.round(imageStageLockHeight)}px` }
+      : undefined
+  ), [imageStageLockHeight])
 
   // 解析视频 MD5
   useEffect(() => {
@@ -7773,6 +8092,14 @@ function MessageBubble({
     captureResizeBaseline(imageContainerRef.current, imageResizeBaselineRef)
   }, [captureResizeBaseline])
 
+  const lockImageStageHeight = useCallback(() => {
+    const host = imageContainerRef.current
+    if (!host) return
+    const height = host.getBoundingClientRect().height
+    if (!Number.isFinite(height) || height <= 0) return
+    setImageStageLockHeight(Math.round(height))
+  }, [])
+
   const captureEmojiResizeBaseline = useCallback(() => {
     captureResizeBaseline(emojiContainerRef.current, emojiResizeBaselineRef)
   }, [captureResizeBaseline])
@@ -7780,6 +8107,12 @@ function MessageBubble({
   const stabilizeImageScrollAfterResize = useCallback(() => {
     stabilizeScrollAfterResize(imageContainerRef.current, imageResizeBaselineRef)
   }, [stabilizeScrollAfterResize])
+
+  const releaseImageStageLock = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      setImageStageLockHeight(null)
+    })
+  }, [])
 
   const stabilizeEmojiScrollAfterResize = useCallback(() => {
     stabilizeScrollAfterResize(emojiContainerRef.current, emojiResizeBaselineRef)
@@ -7901,7 +8234,7 @@ function MessageBubble({
   useEffect(() => {
     if (emojiLocalPath) return
     // 后端已从本地缓存找到文件（转发表情包无 CDN URL 的情况）
-    if (isEmoji && message.emojiLocalPath && !emojiLocalPath) {
+    if (isEmoji && message.emojiLocalPath) {
       captureEmojiResizeBaseline()
       setEmojiLocalPath(message.emojiLocalPath)
       return
@@ -7934,6 +8267,7 @@ function MessageBubble({
           imageDataUrlCache.set(imageCacheKey, result.localPath)
           if (imageLocalPath !== result.localPath) {
             captureImageResizeBaseline()
+            lockImageStageHeight()
           }
           setImageLocalPath(result.localPath)
           setImageHasUpdate(false)
@@ -7949,6 +8283,7 @@ function MessageBubble({
         imageDataUrlCache.set(imageCacheKey, dataUrl)
         if (imageLocalPath !== dataUrl) {
           captureImageResizeBaseline()
+          lockImageStageHeight()
         }
         setImageLocalPath(dataUrl)
         setImageHasUpdate(false)
@@ -7962,7 +8297,7 @@ function MessageBubble({
       imageDecryptPendingRef.current = false
     }
     return { success: false }
-  }, [isImage, message.imageMd5, message.imageDatName, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64, imageLocalPath, captureImageResizeBaseline])
+  }, [isImage, message.imageMd5, message.imageDatName, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64, imageLocalPath, captureImageResizeBaseline, lockImageStageHeight])
 
   const triggerForceHd = useCallback(() => {
     if (!message.imageMd5 && !message.imageDatName) return
@@ -8025,6 +8360,7 @@ function MessageBubble({
           imageDataUrlCache.set(imageCacheKey, resolved.localPath)
           if (imageLocalPath !== resolved.localPath) {
             captureImageResizeBaseline()
+            lockImageStageHeight()
           }
           setImageLocalPath(resolved.localPath)
           if (resolved.liveVideoPath) setImageLiveVideoPath(resolved.liveVideoPath)
@@ -8039,6 +8375,7 @@ function MessageBubble({
     imageLocalPath,
     imageCacheKey,
     captureImageResizeBaseline,
+    lockImageStageHeight,
     message.imageDatName,
     message.imageMd5,
     requestImageDecrypt,
@@ -8052,6 +8389,16 @@ function MessageBubble({
       }
     }
   }, [])
+
+  useEffect(() => {
+    setImageLoaded(false)
+  }, [imageLocalPath])
+
+  useEffect(() => {
+    if (imageLoading) return
+    if (!imageError && imageLocalPath) return
+    setImageStageLockHeight(null)
+  }, [imageError, imageLoading, imageLocalPath])
 
   useEffect(() => {
     if (!isImage || imageLoading) return
@@ -8069,6 +8416,7 @@ function MessageBubble({
         imageDataUrlCache.set(imageCacheKey, result.localPath)
         if (!imageLocalPath || imageLocalPath !== result.localPath) {
           captureImageResizeBaseline()
+          lockImageStageHeight()
           setImageLocalPath(result.localPath)
           setImageError(false)
         }
@@ -8079,7 +8427,7 @@ function MessageBubble({
     return () => {
       cancelled = true
     }
-  }, [isImage, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, imageCacheKey, session.username, captureImageResizeBaseline])
+  }, [isImage, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, imageCacheKey, session.username, captureImageResizeBaseline, lockImageStageHeight])
 
   useEffect(() => {
     if (!isImage) return
@@ -8113,6 +8461,7 @@ function MessageBubble({
         }
         if (imageLocalPath !== payload.localPath) {
           captureImageResizeBaseline()
+          lockImageStageHeight()
         }
         setImageLocalPath((prev) => (prev === payload.localPath ? prev : payload.localPath))
         setImageError(false)
@@ -8121,7 +8470,7 @@ function MessageBubble({
     return () => {
       unsubscribe?.()
     }
-  }, [isImage, imageCacheKey, imageLocalPath, message.imageDatName, message.imageMd5, captureImageResizeBaseline])
+  }, [isImage, imageCacheKey, imageLocalPath, message.imageDatName, message.imageMd5, captureImageResizeBaseline, lockImageStageHeight])
 
   // 图片进入视野前自动解密（懒加载）
   useEffect(() => {
@@ -8504,11 +8853,46 @@ function MessageBubble({
     appMsgTextCache.set(selector, value)
     return value
   }, [appMsgDoc, appMsgTextCache])
+  const queryPreferredQuotedContent = useCallback((): string => {
+    if (message.quotedContent) return message.quotedContent
+    const candidates = [
+      'refermsg > selectedcontent',
+      'refermsg > selectedtext',
+      'refermsg > selectcontent',
+      'refermsg > selecttext',
+      'refermsg > quotecontent',
+      'refermsg > quotetext',
+      'refermsg > partcontent',
+      'refermsg > parttext',
+      'refermsg > excerpt',
+      'refermsg > summary',
+      'refermsg > preview',
+      'refermsg > content'
+    ]
+    for (const selector of candidates) {
+      const value = queryAppMsgText(selector)
+      if (value) return value
+    }
+    return ''
+  }, [message.quotedContent, queryAppMsgText])
+  const appMsgThumbRawCandidate = useMemo(() => (
+    message.linkThumb ||
+    message.appMsgThumbUrl ||
+    queryAppMsgText('appmsg > thumburl') ||
+    queryAppMsgText('appmsg > cdnthumburl') ||
+    queryAppMsgText('appmsg > cover') ||
+    queryAppMsgText('appmsg > coverurl') ||
+    queryAppMsgText('thumburl') ||
+    queryAppMsgText('cdnthumburl') ||
+    queryAppMsgText('cover') ||
+    queryAppMsgText('coverurl') ||
+    ''
+  ).trim(), [message.linkThumb, message.appMsgThumbUrl, queryAppMsgText])
   const quotedSenderUsername = resolveQuotedSenderUsername(
     queryAppMsgText('refermsg > fromusr'),
     queryAppMsgText('refermsg > chatusr')
   )
-  const quotedContent = message.quotedContent || queryAppMsgText('refermsg > content') || ''
+  const quotedContent = queryPreferredQuotedContent()
   const quotedSenderFallbackName = useMemo(
     () => resolveQuotedSenderFallbackDisplayName(
       session.username,
@@ -8637,6 +9021,17 @@ function MessageBubble({
   // Selection mode handling removed from here to allow normal rendering
   // We will wrap the output instead
   if (isSystem) {
+    const isPatSystemMessage = message.localType === 266287972401
+    const patTitleRaw = isPatSystemMessage
+      ? (queryAppMsgText('appmsg > title') || queryAppMsgText('title') || message.parsedContent || '')
+      : ''
+    const patDisplayText = isPatSystemMessage
+      ? cleanMessageContent(String(patTitleRaw).replace(/^\s*\[拍一拍\]\s*/i, ''))
+      : ''
+    const systemContentNode = isPatSystemMessage
+      ? renderTextWithEmoji(patDisplayText || '拍一拍')
+      : message.parsedContent
+
     return (
       <div
         className={`message-bubble system ${isSelectionMode ? 'selectable' : ''}`}
@@ -8665,7 +9060,7 @@ function MessageBubble({
             {isSelected && <Check size={14} strokeWidth={3} />}
           </div>
         )}
-        <div className="bubble-content">{message.parsedContent}</div>
+        <div className="bubble-content">{systemContentNode}</div>
       </div>
     )
   }
@@ -8674,7 +9069,11 @@ function MessageBubble({
   const renderContent = () => {
     if (isImage) {
       return (
-        <div ref={imageContainerRef}>
+        <div
+          ref={imageContainerRef}
+          className={`image-stage ${imageStageLockHeight ? 'locked' : ''}`}
+          style={imageStageLockStyle}
+        >
           {imageLoading ? (
             <div className="image-loading">
               <Loader2 size={20} className="spin" />
@@ -8696,15 +9095,19 @@ function MessageBubble({
                 <img
                   src={imageLocalPath}
                   alt="图片"
-                  className="image-message"
+                  className={`image-message ${imageLoaded ? 'ready' : 'pending'}`}
                   onClick={() => { void handleOpenImageViewer() }}
                   onLoad={() => {
+                    setImageLoaded(true)
                     setImageError(false)
                     stabilizeImageScrollAfterResize()
+                    releaseImageStageLock()
                   }}
                   onError={() => {
                     imageResizeBaselineRef.current = null
+                    setImageLoaded(false)
                     setImageError(true)
+                    releaseImageStageLock()
                   }}
                 />
                 {imageLiveVideoPath && (
@@ -9030,10 +9433,16 @@ function MessageBubble({
 
       const xmlType = message.xmlType || q('appmsg > type') || q('type')
 
+      // type 62: 拍一拍（按普通文本渲染，支持 [烟花] 这类 emoji 占位符）
+      if (xmlType === '62') {
+        const patText = cleanMessageContent((q('title') || cleanedParsedContent || '').replace(/^\s*\[拍一拍\]\s*/i, ''))
+        return <div className="bubble-content">{renderTextWithEmoji(patText || '拍一拍')}</div>
+      }
+
       // type 57: 引用回复消息，解析 refermsg 渲染为引用样式
       if (xmlType === '57') {
         const replyText = q('title') || cleanedParsedContent || ''
-        const referContent = q('refermsg > content') || ''
+        const referContent = queryPreferredQuotedContent()
         const referType = q('refermsg > type') || ''
 
         // 根据被引用消息类型渲染对应内容
@@ -9070,10 +9479,76 @@ function MessageBubble({
         )
       }
 
+      if (xmlType === '53' || message.appMsgKind === 'solitaire') {
+        const solitaireText = message.linkTitle || q('appmsg > title') || q('title') || cleanedParsedContent || '接龙'
+        const solitaire = parseSolitaireContent(solitaireText)
+        const previewEntries = solitaireExpanded ? solitaire.entries : solitaire.entries.slice(0, 3)
+        const hiddenEntryCount = Math.max(0, solitaire.entries.length - previewEntries.length)
+        const introLines = solitaireExpanded ? solitaire.introLines : solitaire.introLines.slice(0, 4)
+        const hasMoreIntro = !solitaireExpanded && solitaire.introLines.length > introLines.length
+        const countText = solitaire.entries.length > 0 ? `${solitaire.entries.length} 人参与` : '接龙消息'
+
+        return (
+          <div
+            className={`solitaire-message${solitaireExpanded ? ' expanded' : ''}`}
+            role="button"
+            tabIndex={0}
+            aria-expanded={solitaireExpanded}
+            onClick={isSelectionMode ? undefined : (e) => {
+              e.stopPropagation()
+              setSolitaireExpanded(value => !value)
+            }}
+            onKeyDown={isSelectionMode ? undefined : (e) => {
+              if (e.key !== 'Enter' && e.key !== ' ') return
+              e.preventDefault()
+              e.stopPropagation()
+              setSolitaireExpanded(value => !value)
+            }}
+            title={solitaireExpanded ? '点击收起接龙' : '点击展开接龙'}
+          >
+            <div className="solitaire-header">
+              <div className="solitaire-icon" aria-hidden="true">
+                <Hash size={18} />
+              </div>
+              <div className="solitaire-heading">
+                <div className="solitaire-title">{solitaire.title}</div>
+                <div className="solitaire-meta">{countText}</div>
+              </div>
+            </div>
+            {introLines.length > 0 && (
+              <div className="solitaire-intro">
+                {introLines.map((line, index) => (
+                  <div key={`${line}-${index}`} className="solitaire-intro-line">{line}</div>
+                ))}
+                {hasMoreIntro && <div className="solitaire-muted-line">...</div>}
+              </div>
+            )}
+            {previewEntries.length > 0 ? (
+              <div className="solitaire-entry-list">
+                {previewEntries.map(entry => (
+                  <div key={`${entry.index}-${entry.text}`} className="solitaire-entry">
+                    <span className="solitaire-entry-index">{entry.index}</span>
+                    <span className="solitaire-entry-text">{entry.text}</span>
+                  </div>
+                ))}
+                {hiddenEntryCount > 0 && (
+                  <div className="solitaire-muted-line">还有 {hiddenEntryCount} 条...</div>
+                )}
+              </div>
+            ) : null}
+            <div className="solitaire-footer">
+              <span>{solitaireExpanded ? '收起接龙' : '展开接龙'}</span>
+              <ChevronDown size={14} className="solitaire-chevron" />
+            </div>
+          </div>
+        )
+      }
+
       const title = message.linkTitle || q('title') || cleanedParsedContent || 'Card'
       const desc = message.appMsgDesc || q('des')
       const url = message.linkUrl || q('url')
-      const thumbUrl = message.linkThumb || message.appMsgThumbUrl || q('thumburl') || q('cdnthumburl') || q('cover') || q('coverurl')
+      const fallbackThumbUrl = appMsgThumbRawCandidate
+      const thumbUrl = isRenderableImageSrc(fallbackThumbUrl) ? fallbackThumbUrl : ''
       const musicUrl = message.appMsgMusicUrl || message.appMsgDataUrl || q('musicurl') || q('playurl') || q('dataurl') || q('lowurl')
       const sourceName = message.appMsgSourceName || q('sourcename')
       const sourceDisplayName = q('sourcedisplayname') || ''
@@ -9147,9 +9622,7 @@ function MessageBubble({
                 loading="lazy"
                 referrerPolicy="no-referrer"
               />
-            ) : (
-              <div className={`link-thumb-placeholder ${cardKind}`}>{cardKind.slice(0, 2).toUpperCase()}</div>
-            )}
+            ) : null}
           </div>
         </div>
       )
@@ -9157,7 +9630,7 @@ function MessageBubble({
       if (kind === 'quote') {
         // 引用回复消息（appMsgKind='quote'，xmlType=57）
         const replyText = message.linkTitle || q('title') || cleanedParsedContent || ''
-        const referContent = message.quotedContent || q('refermsg > content') || ''
+        const referContent = queryPreferredQuotedContent()
         return (
           renderBubbleWithQuote(
             renderQuotedMessageBlock(renderTextWithEmoji(cleanMessageContent(referContent))),
@@ -9348,7 +9821,7 @@ function MessageBubble({
       // 引用回复消息 (type=57)，防止被误判为链接
       if (appMsgType === '57') {
         const replyText = parsedDoc?.querySelector('title')?.textContent?.trim() || cleanedParsedContent || ''
-        const referContent = parsedDoc?.querySelector('refermsg > content')?.textContent?.trim() || ''
+        const referContent = queryPreferredQuotedContent()
         const referType = parsedDoc?.querySelector('refermsg > type')?.textContent?.trim() || ''
 
         const renderReferContent2 = () => {
@@ -9589,9 +10062,6 @@ function MessageBubble({
             </div>
             <div className="link-body">
               <div className="link-desc" title={desc}>{desc}</div>
-              <div className="link-thumb-placeholder">
-                <Link size={24} />
-              </div>
             </div>
           </div>
         )
