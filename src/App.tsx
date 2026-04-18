@@ -26,6 +26,7 @@ import ContactsPage from './pages/ContactsPage'
 import ResourcesPage from './pages/ResourcesPage'
 import ChatHistoryPage from './pages/ChatHistoryPage'
 import NotificationWindow from './pages/NotificationWindow'
+import AccountManagementPage from './pages/AccountManagementPage'
 
 import { useAppStore } from './stores/appStore'
 import { themes, useThemeStore, type ThemeId, type ThemeMode } from './stores/themeStore'
@@ -38,8 +39,6 @@ import UpdateDialog from './components/UpdateDialog'
 import UpdateProgressCapsule from './components/UpdateProgressCapsule'
 import LockScreen from './components/LockScreen'
 import { GlobalSessionMonitor } from './components/GlobalSessionMonitor'
-import { BatchTranscribeGlobal } from './components/BatchTranscribeGlobal'
-import { BatchImageDecryptGlobal } from './components/BatchImageDecryptGlobal'
 import WindowCloseDialog from './components/WindowCloseDialog'
 
 function RouteStateRedirect({ to }: { to: string }) {
@@ -553,10 +552,6 @@ function App() {
       {/* 全局会话监听与通知 */}
       <GlobalSessionMonitor />
 
-      {/* 全局批量转写进度浮窗 */}
-      <BatchTranscribeGlobal />
-      <BatchImageDecryptGlobal />
-
       {/* 用户协议弹窗 */}
       {showAgreement && !agreementLoading && (
         <div className="agreement-overlay">
@@ -678,6 +673,7 @@ function App() {
             <Routes location={routeLocation}>
               <Route path="/" element={<HomePage />} />
               <Route path="/home" element={<HomePage />} />
+              <Route path="/account-management" element={<AccountManagementPage />} />
               <Route path="/chat" element={<ChatPage />} />
 
               <Route path="/analytics" element={<ChatAnalyticsHubPage />} />
